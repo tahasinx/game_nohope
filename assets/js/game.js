@@ -2203,6 +2203,8 @@ const touchMove = new THREE.Vector2();
 const touchControls = document.getElementById('touchControls');
 const touchStick = document.getElementById('touchStick');
 const touchKnob = document.getElementById('touchKnob');
+const TOUCH_STICK_DEAD_ZONE = 0.1;
+const TOUCH_TURN_RATE = 14;
 let touchAiming = false;
 let mouseAimActive = !touchMode;
 if (touchMode) document.body.classList.add('touch-device');
@@ -2234,8 +2236,11 @@ function updateTouchStick(pointer) {
   const length = Math.hypot(dx, dy);
   const scale = length > max ? max / length : 1;
   const x = dx * scale / max, y = dy * scale / max;
-  const deadZone = 0.14;
-  touchMove.set(Math.abs(x) < deadZone ? 0 : x, Math.abs(y) < deadZone ? 0 : y);
+  const magnitude = Math.hypot(x, y);
+  const strength = magnitude <= TOUCH_STICK_DEAD_ZONE
+    ? 0
+    : (magnitude - TOUCH_STICK_DEAD_ZONE) / (1 - TOUCH_STICK_DEAD_ZONE);
+  touchMove.set(magnitude ? x / magnitude * strength : 0, magnitude ? y / magnitude * strength : 0);
   touchKnob.style.transform = `translate(${dx * scale}px, ${dy * scale}px)`;
 }
 
@@ -3882,7 +3887,8 @@ function update(dt) {
         player.rotation.y = a;
       }
     } else if (touchMode && moving) {
-      player.rotation.y = Math.atan2(mx, mz);
+      const targetYaw = Math.atan2(mx, mz);
+      player.rotation.y = damp(player.rotation.y, player.rotation.y + wrapA(targetYaw - player.rotation.y), TOUCH_TURN_RATE, dt);
     }
 
     // --- weapon ---
