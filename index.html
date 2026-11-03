@@ -10,7 +10,7 @@
 </script>
 
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>ABANDON ALL HOPE</title>
 <link rel="icon" type="image/png" sizes="32x32" href="favicon.png" />
 <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png" />
@@ -19,7 +19,7 @@
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #05060a; }
-  #game { display: block; width: 100vw; height: 100vh; }
+  #game { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
   body { font-family: "Jersey 25", "Courier New", monospace; color: #cdd2d8; }
 
   /* worn, chipped-paint look for the big Anton titles (matches the store cover art) */
@@ -281,6 +281,93 @@
   .vmenu button:hover::after { content: "‹"; }
   #deathTitle { font-family: "Anton", sans-serif; font-size: clamp(72px, 12vw, 170px); letter-spacing: 10px; color: #b8332b; filter: drop-shadow(0 4px 0 #000) drop-shadow(0 0 28px #b8332b55); }
   #deathStat { color: #d6453c; font-size: 22px; letter-spacing: 4px; margin-top: 22px; }
+
+  /* Touch controls are enabled only on touch-capable devices and during a run. */
+  #touchControls { position: fixed; inset: 0; z-index: 4; pointer-events: none; user-select: none; }
+  #touchControls.hidden { display: none; }
+  #touchStick {
+    position: absolute; left: max(22px, env(safe-area-inset-left)); bottom: max(22px, env(safe-area-inset-bottom));
+    width: 136px; height: 136px; border: 1px solid #e9e2d655; border-radius: 50%;
+    background: #090a0d66; box-shadow: inset 0 0 22px #0009, 0 0 18px #0008;
+  }
+  #touchStick::before {
+    content: ""; position: absolute; inset: 24px; border: 1px solid #e9e2d633; border-radius: 50%;
+  }
+  #touchKnob {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px;
+    border: 1px solid #e9e2d699; border-radius: 50%; background: #d6453c66;
+    box-shadow: 0 0 18px #d6453c55; transform: translate(0, 0);
+  }
+  .touch-button {
+    position: absolute; display: flex; align-items: center; justify-content: center;
+    color: #e9e2d6; font: inherit; letter-spacing: 2px; border: 1px solid #e9e2d677;
+    background: #090a0dcc; box-shadow: 0 0 18px #0009; touch-action: none; pointer-events: auto;
+  }
+  #touchFire {
+    right: max(22px, env(safe-area-inset-right)); bottom: max(26px, env(safe-area-inset-bottom));
+    width: 106px; height: 106px; border: 2px solid #d6453caa; border-radius: 50%;
+    background: #d6453c33; font-size: 19px; box-shadow: inset 0 0 20px #d6453c22, 0 0 20px #0009;
+  }
+  #touchFire:active { background: #d6453c88; }
+  #touchReload {
+    right: max(42px, calc(env(safe-area-inset-right) + 20px)); bottom: max(148px, calc(env(safe-area-inset-bottom) + 126px));
+    min-width: 76px; min-height: 48px; border-radius: 24px; font-size: 15px;
+  }
+  #touchPause {
+    top: max(16px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; font-size: 22px;
+  }
+  #touchControls .touch-button:active { border-color: #d6453c; color: #fff; }
+  @media (pointer: coarse), (max-width: 700px) {
+    body.touch-device #topbar { right: 78px; }
+    body.touch-device #ammoWrap { bottom: max(22px, env(safe-area-inset-bottom)); }
+    body.touch-device #reloadHint { display: none; }
+    body.touch-device #touchControls { display: block; }
+    body.touch-device.titling #touchControls { display: none; }
+    body.touch-device #menuCol {
+      left: max(22px, env(safe-area-inset-left)); top: 43%; width: calc(100vw - 44px);
+    }
+    body.touch-device #titleTop { font-size: clamp(24px, 7vw, 42px); }
+    body.touch-device #titleMain { font-size: clamp(58px, 17vw, 92px); }
+    body.touch-device #pressAny { margin-top: 36px; font-size: 18px; letter-spacing: 5px; }
+    body.touch-device #menuList { margin-top: 24px; }
+    body.touch-device #menuList button { padding: 10px 0 10px 18px; }
+    body.touch-device #menuList button span { font-size: clamp(26px, 8vw, 34px); }
+    body.touch-device #menuFoot { left: 22px; right: 22px; bottom: max(16px, env(safe-area-inset-bottom)); }
+    body.touch-device #menuHints { display: none; }
+    body.touch-device .mpanel {
+      top: auto; bottom: max(16px, env(safe-area-inset-bottom)); left: 16px; width: calc(100vw - 32px);
+      max-height: 44vh; overflow-y: auto; padding: 18px;
+      transform: translateY(18px);
+    }
+    body.touch-device .mpanel.open { transform: translateY(0); }
+    body.touch-device .crow { gap: 8px; font-size: 16px; letter-spacing: 1px; }
+    body.touch-device .touch-row b { font-size: 14px; letter-spacing: 0; }
+    body.touch-device .crow .caps { width: 112px; flex-shrink: 0; }
+    body.touch-device .crow em { font-size: 13px; }
+    body.touch-device #cards { gap: 8px; width: calc(100vw - 20px); margin-top: 18px; }
+    body.touch-device .card { width: calc((100vw - 44px) / 3); min-width: 0; padding: 10px 8px; }
+    body.touch-device .cdesc { font-size: 14px; min-height: 0; }
+    body.touch-device .cstat { font-size: 15px; }
+    body.touch-device #pickerTitle { font-size: 46px; }
+    body.touch-device #pickerSub { font-size: 13px; letter-spacing: 3px; }
+    body.touch-device .overlay { padding: 18px; }
+    body.touch-device #pauseTitle { font-size: clamp(52px, 15vw, 86px); }
+    body.touch-device #deathTitle { font-size: clamp(58px, 17vw, 100px); }
+    body.touch-device .vmenu { margin-top: 20px; }
+    body.touch-device .vmenu button { min-height: 52px; font-size: 25px; }
+  }
+  @media (max-width: 700px) and (max-height: 430px) {
+    #touchStick { width: 108px; height: 108px; }
+    #touchStick::before { inset: 18px; }
+    #touchKnob { width: 46px; height: 46px; margin: -23px; }
+    #touchFire { width: 84px; height: 84px; }
+    #touchReload { bottom: max(116px, calc(env(safe-area-inset-bottom) + 94px)); }
+    body.touch-device #menuCol { top: 40%; }
+    body.touch-device #pressAny { margin-top: 20px; }
+    body.touch-device #menuList { margin-top: 12px; }
+    body.touch-device .mpanel { max-height: 60vh; }
+  }
 </style>
 
 </head>
@@ -339,6 +426,7 @@
       <div class="crow"><span class="caps"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><b>MOVE</b></div>
       <div class="crow"><span class="caps"><kbd class="wide">MOUSE</kbd></span><b>AIM</b></div>
       <div class="crow"><span class="caps"><kbd class="wide">CLICK</kbd></span><b>SHOOT</b><em>hold to keep firing</em></div>
+      <div class="crow touch-row"><span class="caps"><kbd class="wide">TOUCH</kbd></span><b>LEFT MOVE · RIGHT AIM/FIRE</b></div>
       <div class="crow"><span class="caps"><kbd>R</kbd></span><b>RELOAD</b></div>
       <div class="crow"><span class="caps"><kbd class="wide">ESC</kbd></span><b>PAUSE</b></div>
       <div class="crow"><span class="caps"><kbd>M</kbd></span><b>MUTE</b></div>
@@ -360,6 +448,12 @@
   </div>
 </div>
 <div id="fadeIn"></div>
+<div id="touchControls" class="hidden" aria-label="Touch controls">
+  <div id="touchStick" aria-hidden="true"><div id="touchKnob"></div></div>
+  <button id="touchFire" class="touch-button" type="button" aria-label="Aim and fire">FIRE</button>
+  <button id="touchReload" class="touch-button" type="button">RELOAD</button>
+  <button id="touchPause" class="touch-button" type="button" aria-label="Pause">Ⅱ</button>
+</div>
 
 <div id="pause" class="overlay hidden">
   <div id="pauseTitle" class="distressed">PAUSED</div>
@@ -2577,9 +2671,44 @@ const bloodMat = new THREE.MeshStandardMaterial({ color: 0x6a0e0e, roughness: 0.
 const keys = {};
 const mouse = new THREE.Vector2();
 let firing = false;
+let mouseFiring = false;
+const touchPointers = new Map();
+const touchMove = new THREE.Vector2();
+const touchControls = document.getElementById('touchControls');
+const touchStick = document.getElementById('touchStick');
+const touchKnob = document.getElementById('touchKnob');
+const touchMode = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || window.matchMedia('(pointer: coarse)').matches;
+if (touchMode) document.body.classList.add('touch-device');
 const aimPoint = new THREE.Vector3();
 const aimPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.9);
 const raycaster = new THREE.Raycaster();
+
+function updateFiring() {
+  firing = mouseFiring || [...touchPointers.values()].some(p => p.type === 'aim');
+}
+function setTouchAim(x, y) {
+  mouse.x = (x / window.innerWidth) * 2 - 1;
+  mouse.y = -(y / window.innerHeight) * 2 + 1;
+}
+function clearTouchInput() {
+  touchPointers.clear();
+  touchMove.set(0, 0);
+  touchKnob.style.transform = 'translate(0, 0)';
+  updateFiring();
+}
+function updateTouchStick(pointer) {
+  const rect = touchStick.getBoundingClientRect();
+  const max = rect.width * 0.32;
+  if (!max) return;
+  const dx = pointer.x - (rect.left + rect.width / 2);
+  const dy = pointer.y - (rect.top + rect.height / 2);
+  const length = Math.hypot(dx, dy);
+  const scale = length > max ? max / length : 1;
+  const x = dx * scale / max, y = dy * scale / max;
+  const deadZone = 0.14;
+  touchMove.set(Math.abs(x) < deadZone ? 0 : x, Math.abs(y) < deadZone ? 0 : y);
+  touchKnob.style.transform = `translate(${dx * scale}px, ${dy * scale}px)`;
+}
 
 window.addEventListener('keydown', e => {
   if (menu.key(e)) { e.preventDefault(); return; }
@@ -2591,16 +2720,62 @@ window.addEventListener('keydown', e => {
   if (state.choosing && /^Digit[1-3]$/.test(e.code)) choose(+e.code.slice(5) - 1);
   if (e.code === 'KeyM') {
     const m = audio.toggleMute();
-    document.getElementById('reloadHint').textContent = m ? '[R] RELOAD   ·   [M] MUTED' : '[R] RELOAD';
+    document.getElementById('reloadHint').textContent = touchMode
+      ? (m ? 'TAP RELOAD   ·   MUTED' : 'TAP RELOAD   ·   TAP FIRE')
+      : (m ? '[R] RELOAD   ·   [M] MUTED' : '[R] RELOAD');
   }
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 window.addEventListener('mousemove', e => {
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  setTouchAim(e.clientX, e.clientY);
 });
-window.addEventListener('mousedown', () => { firing = true; });
-window.addEventListener('mouseup', () => { firing = false; });
+window.addEventListener('mousedown', () => { mouseFiring = true; updateFiring(); });
+window.addEventListener('mouseup', () => { mouseFiring = false; updateFiring(); });
+window.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'touch' || !state.running || state.paused || state.choosing) return;
+  const target = e.target instanceof Element ? e.target : null;
+  if (target?.closest('#touchReload, #touchPause')) return;
+  const rect = touchStick.getBoundingClientRect();
+  const overStick = e.clientX >= rect.left && e.clientX <= rect.right &&
+    e.clientY >= rect.top && e.clientY <= rect.bottom;
+  if (overStick) {
+    if ([...touchPointers.values()].some(p => p.type === 'move')) return;
+    const pointer = { type: 'move', x: e.clientX, y: e.clientY };
+    touchPointers.set(e.pointerId, pointer);
+    updateTouchStick(pointer);
+  } else if (e.clientX >= window.innerWidth * 0.42 || target?.closest('#touchFire')) {
+    const pointer = { type: 'aim', x: e.clientX, y: e.clientY };
+    touchPointers.set(e.pointerId, pointer);
+    setTouchAim(e.clientX, e.clientY);
+    updateFiring();
+  } else {
+    return;
+  }
+  e.preventDefault();
+});
+window.addEventListener('pointermove', e => {
+  const pointer = touchPointers.get(e.pointerId);
+  if (!pointer) return;
+  pointer.x = e.clientX;
+  pointer.y = e.clientY;
+  if (pointer.type === 'move') updateTouchStick(pointer);
+  else setTouchAim(e.clientX, e.clientY);
+  e.preventDefault();
+});
+function releaseTouchPointer(e) {
+  const pointer = touchPointers.get(e.pointerId);
+  if (!pointer) return;
+  touchPointers.delete(e.pointerId);
+  if (pointer.type === 'move') {
+    touchMove.set(0, 0);
+    touchKnob.style.transform = 'translate(0, 0)';
+  }
+  updateFiring();
+}
+window.addEventListener('pointerup', releaseTouchPointer);
+window.addEventListener('pointercancel', releaseTouchPointer);
+document.getElementById('touchReload').addEventListener('click', startReload);
+document.getElementById('touchPause').addEventListener('click', () => setPaused(true));
 window.addEventListener('contextmenu', e => e.preventDefault());
 
 // the death screen: go again, or back to the title
@@ -3653,7 +3828,8 @@ function setPaused(on) {
   if (on && !state.running) return; // only a live run can pause
   if (on === state.paused) return;
   state.paused = on;
-  firing = false;
+  mouseFiring = false;
+  clearTouchInput();
   for (const k in keys) keys[k] = false; // keyups are missed while the menu is up
   document.getElementById('pauseStat').textContent = `WAVE ${state.wave} · ${state.kills} KILLS`;
   document.getElementById('pause').classList.toggle('hidden', !on);
@@ -3670,7 +3846,8 @@ function quitToTitle() {
 
 function die() {
   state.running = false;
-  firing = false;
+  mouseFiring = false;
+  clearTouchInput();
   document.getElementById('deathStat').textContent =
     `YOU REACHED WAVE ${state.wave} · ${state.kills} KILLS`;
   // best night is ranked by kills, like the leaderboard
@@ -4088,11 +4265,14 @@ function update(dt) {
     if (keys['KeyS'] || keys['ArrowDown']) mz += 1;
     if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
     if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+    mx += touchMove.x;
+    mz += touchMove.y;
     const moving = !!(mx || mz);
     if (moving) {
       const l = Math.hypot(mx, mz);
-      player.position.x += (mx / l) * state.speed * dt;
-      player.position.z += (mz / l) * state.speed * dt;
+      const speed = state.speed * Math.min(1, l);
+      player.position.x += (mx / l) * speed * dt;
+      player.position.z += (mz / l) * speed * dt;
     }
     // clamp inside cabin
     const lim = HALF - 0.7;
@@ -4340,6 +4520,7 @@ function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   if (!state.paused) update(dt);
+  touchControls.classList.toggle('hidden', !touchMode || !state.running || state.paused || state.choosing);
   renderer.render(scene, camera);
   requestAnimationFrame(loop);
 }
