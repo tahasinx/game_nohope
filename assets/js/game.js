@@ -1,0 +1,4141 @@
+import * as THREE from 'three';
+
+// The Wavedash SDK is injected as the global `window.Wavedash` by the Wavedash
+// runtime — the `wavedash dev` server locally, and the platform sandbox in
+// production — which loads it before this game code runs. (The @wvdsh/sdk-js
+// npm package is just a typed re-export of this same global, for bundler
+// projects.) It is absent when index.html is opened directly, so every use is
+// guarded and the game stays fully playable standalone, just without
+// leaderboards.
+const Wavedash = window.Wavedash ?? null;
+const touchMode = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || window.matchMedia('(pointer: coarse)').matches;
+
+// ===================================================================
+// Abandon All Hope — top-down nighttime cabin survival shooter
+// ===================================================================
+
+const canvas = document.getElementById('game');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, touchMode ? 1.5 : 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x05060a);
+scene.fog = new THREE.Fog(0x05060a, 32, 62);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200);
+const CAM_OFFSET = new THREE.Vector3(0, 30, 13);
+
+function onResize() {
+  const width = Math.max(1, window.visualViewport?.width || window.innerWidth);
+  const height = Math.max(1, window.visualViewport?.height || window.innerHeight);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  renderer.setSize(width, height);
+}
+window.addEventListener('resize', onResize);
+window.visualViewport?.addEventListener('resize', onResize);
+onResize();
+
+// ---------- shared geometry / materials ----------
+const BOX = new THREE.BoxGeometry(1, 1, 1);
+
+// ---------- block building: everything in the game is made of these ----------
+// chamfered box: every edge is cut at 45° so it catches a thin highlight,
+// which keeps the blocks reading as separate shapes at gameplay distance.
+// Built at its real size (not scaled) so the bevels stay even, with UVs
+// box-projected in world units so a texture keeps one scale on every part.
+const UV_UNIT = 0.32; // world units per texture repeat
+const bevelCache = new Map();
+function bevelBox(w, h, d, r = 0.03) {
+  const key = `${w},${h},${d},${r}`;
+  if (bevelCache.has(key)) return bevelCache.get(key);
+  const e = [w / 2, h / 2, d / 2];
+  r = Math.min(r, e[0] * 0.45, e[1] * 0.45, e[2] * 0.45);
+  // corner `s` (a sign per axis), pulled in by r on every axis except `a`
+  const V = (s, a) => e.map((v, i) => s[i] * (i === a ? v : v - r));
+  const sg = (a, sa, b, sb, c, sc) => { const s = []; s[a] = sa; s[b] = sb; s[c] = sc; return s; };
+  const pos = [], nrm = [], uv = [];
+  const p0 = new THREE.Vector3(), n = new THREE.Vector3(), q = new THREE.Vector3();
+  const face = pts => {
+    p0.fromArray(pts[0]);
+    n.fromArray(pts[1]).sub(p0).cross(q.fromArray(pts[2]).sub(p0)).normalize();
+    if (n.dot(p0) < 0) { pts = pts.slice().reverse(); n.negate(); } // wind outward (the box is convex)
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    const [u, v] = ax >= ay && ax >= az ? [2, 1] : ay >= az ? [0, 2] : [0, 1];
+    for (let i = 1; i < pts.length - 1; i++) {
+      for (const p of [pts[0], pts[i], pts[i + 1]]) {
+        pos.push(p[0], p[1], p[2]); nrm.push(n.x, n.y, n.z); uv.push(p[u] / UV_UNIT, p[v] / UV_UNIT);
+      }
+    }
+  };
+  for (let a = 0; a < 3; a++) {
+    const b = (a + 1) % 3, c = (a + 2) % 3;
+    for (const sa of [1, -1]) {
+      face([[1, 1], [1, -1], [-1, -1], [-1, 1]].map(([sb, sc]) => V(sg(a, sa, b, sb, c, sc), a))); // flat face
+      for (const sb of [1, -1]) {                                                                  // bevel strip a|b
+        face([V(sg(a, sa, b, sb, c, 1), a), V(sg(a, sa, b, sb, c, -1), a),
+              V(sg(a, sa, b, sb, c, -1), b), V(sg(a, sa, b, sb, c, 1), b)]);
+      }
+    }
+  }
+  for (const x of [1, -1]) for (const y of [1, -1]) for (const z of [1, -1]) {
+    face([0, 1, 2].map(a => V([x, y, z], a)));                                                     // corner
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  bevelCache.set(key, g);
+  return g;
+}
+// Collects colored blocks into one vertex-colored geometry, so a whole wall, prop or
+// body part is a single draw call. A block: [w, h, d, x, y, z, color, rx, ry, rz, bevel]
+// (turned by ry, then tilted by rx and rz).
+// `parent` (optional Matrix4) places a whole group of blocks, e.g. a prop in the world.
+const _bkM = new THREE.Matrix4(), _bkN = new THREE.Matrix3(), _bkQ = new THREE.Quaternion(), _bkE = new THREE.Euler();
+const _bkP = new THREE.Vector3(), _bkS = new THREE.Vector3(1, 1, 1), _bkV = new THREE.Vector3(), _bkC = new THREE.Color();
+// `flat` (or a bevel of 0) uses plain 12-triangle boxes: for blades of grass and far-off
+// trees, where a chamfer wouldn't be seen but would cost 44 triangles a block.
+const plainCache = new Map();
+const plainBox = (w, h, d) => {
+  const key = `${w},${h},${d}`;
+  if (!plainCache.has(key)) plainCache.set(key, new THREE.BoxGeometry(w, h, d).toNonIndexed());
+  return plainCache.get(key);
+};
+class BlockBatch {
+  constructor() { this.pos = []; this.nrm = []; this.col = []; }
+  add(blocks, rng, parent, flat = false) {
+    for (const [w, h, d, x, y, z, hex, rx = 0, ry = 0, rz = 0, r = 0.025] of blocks) {
+      const g = flat || r <= 0 ? plainBox(w, h, d) : bevelBox(w, h, d, r);
+      _bkM.compose(_bkP.set(x, y, z), _bkQ.setFromEuler(_bkE.set(rx, ry, rz, 'YXZ')), _bkS);
+      if (parent) _bkM.premultiply(parent);
+      _bkN.getNormalMatrix(_bkM);
+      // each block a shade lighter or darker, for a hand-painted look
+      _bkC.setHex(hex).multiplyScalar(0.9 + rng() * 0.2);
+      const P = g.attributes.position.array, N = g.attributes.normal.array;
+      for (let i = 0; i < P.length; i += 3) {
+        _bkV.fromArray(P, i).applyMatrix4(_bkM); this.pos.push(_bkV.x, _bkV.y, _bkV.z);
+        _bkV.fromArray(N, i).applyMatrix3(_bkN).normalize(); this.nrm.push(_bkV.x, _bkV.y, _bkV.z);
+        this.col.push(_bkC.r, _bkC.g, _bkC.b);
+      }
+    }
+    return this;
+  }
+  build() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nrm, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
+    return g;
+  }
+}
+const bakeBlocks = (blocks, rng, flat) => new BlockBatch().add(blocks, rng, null, flat).build();
+// small seeded RNG so baked models come out the same every load
+function seeded(n) {
+  return () => ((n = (n * 1664525 + 1013904223) >>> 0) / 4294967296);
+}
+
+// ===================================================================
+// AUDIO — procedural Web Audio (no external files). Classic chip voices
+// (NES-style pulse waves, a 4-bit stepped triangle and LFSR noise) played
+// through a modern mix: separate buses, convolution reverb, tempo-synced echo,
+// music ducking, stereo placement and a bus compressor.
+// ===================================================================
+const midiHz = m => 440 * Math.pow(2, (m - 69) / 12);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// --- saved settings and best run (localStorage can throw in a sandboxed frame, so guard it) ---
+const store = {
+  get(k, fallback) { try { return JSON.parse(localStorage.getItem('aah-' + k)) ?? fallback; } catch { return fallback; } },
+  set(k, v) { try { localStorage.setItem('aah-' + k, JSON.stringify(v)); } catch { /* not persisted */ } },
+};
+const settings = Object.assign({ master: 8, music: 8, shake: true }, store.get('settings', {})); // volumes are 0..10
+
+const audio = {
+  ctx: null, muted: false, waves: {}, bufs: {}, lastHit: 0, lastHover: 0, stepAlt: false,
+  ensure() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.buildVoices();
+    this.buildMix();
+    this.applyVolume();
+    this.startWind();
+    music.start();
+  },
+  ok() { return this.ctx && !this.muted; },
+  t() { return this.ctx.currentTime; },
+
+  // --- chip voices: band-limited pulse/triangle tables + LFSR noise buffers ---
+  buildVoices() {
+    const c = this.ctx;
+    // DFT one cycle of samples into a PeriodicWave (band-limited, so no aliasing fizz)
+    const table = s => {
+      const N = s.length, H = 64, re = new Float32Array(H), im = new Float32Array(H);
+      for (let n = 1; n < H; n++) for (let k = 0; k < N; k++) {
+        const ph = 2 * Math.PI * n * k / N;
+        re[n] += s[k] * Math.cos(ph); im[n] += s[k] * Math.sin(ph);
+      }
+      return c.createPeriodicWave(re, im);
+    };
+    const cycle = fn => Array.from({ length: 256 }, (_, k) => fn(k / 256));
+    this.waves.pulse12 = table(cycle(p => p < 0.125 ? 1 : -1));
+    this.waves.pulse25 = table(cycle(p => p < 0.25 ? 1 : -1));
+    this.waves.pulse50 = table(cycle(p => p < 0.5 ? 1 : -1));
+    // the NES triangle is a 32-step, 4-bit staircase — that grit is the "classic" bass
+    this.waves.tri = table(cycle(p => { const s = Math.floor(p * 32); return (s < 16 ? 15 - s : s - 16) / 7.5 - 1; }));
+
+    // 15-bit LFSR noise: long mode = hiss, short mode (93-step loop) = metallic buzz
+    const lfsr = (short, len) => {
+      const b = c.createBuffer(1, len, c.sampleRate), d = b.getChannelData(0);
+      let r = 1;
+      for (let i = 0; i < len; i++) {
+        const fb = (r & 1) ^ ((r >> (short ? 6 : 1)) & 1);
+        r = (r >> 1) | (fb << 14);
+        d[i] = r & 1 ? 0.8 : -0.8;
+      }
+      return b;
+    };
+    this.bufs.noise = lfsr(false, c.sampleRate * 2);
+    this.bufs.metal = lfsr(true, 93 * 64);
+    const w = c.createBuffer(1, c.sampleRate * 2, c.sampleRate), wd = w.getChannelData(0);
+    for (let i = 0; i < wd.length; i++) wd[i] = Math.random() * 2 - 1;
+    this.bufs.white = w;
+  },
+
+  // --- mix: sfx/music/reverb buses → master → muffle → post → mute → compressor ---
+  buildMix() {
+    const c = this.ctx;
+    const gain = (v, to) => { const g = c.createGain(); g.gain.value = v; if (to) g.connect(to); return g; };
+    const filt = (type, f, to) => { const b = c.createBiquadFilter(); b.type = type; b.frequency.value = f; if (to) b.connect(to); return b; };
+    this.comp = c.createDynamicsCompressor();
+    this.comp.threshold.value = -12; this.comp.knee.value = 8; this.comp.ratio.value = 5;
+    this.comp.attack.value = 0.002; this.comp.release.value = 0.2;
+    // brickwall limiter after the glue compressor so stacked impacts never clip
+    this.limiter = c.createDynamicsCompressor();
+    this.limiter.threshold.value = -2; this.limiter.knee.value = 0; this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.001; this.limiter.release.value = 0.08;
+    this.comp.connect(this.limiter); this.limiter.connect(c.destination);
+    this.mute = gain(this.level(), this.comp);
+    this.post = gain(1, this.mute);                 // after the muffle: impacts that should stay crisp
+    this.muffle = filt('lowpass', 20000, this.post); // swept down when you get hit
+    this.master = gain(0.8, this.muffle);
+    this.sfx = gain(1, this.master);
+    this.verb = c.createConvolver(); this.verb.buffer = this.impulse(2.8);
+    this.verb.connect(gain(0.45, this.master));
+    // music: in → [echo] → lowpass → duck → volume → master, with a reverb send
+    this.musicVol = gain(1, this.master);
+    this.duck = gain(1, this.musicVol);
+    this.musicLP = filt('lowpass', 18000, this.duck);
+    this.musicIn = gain(0.5, this.musicLP);
+    this.musicVerb = gain(1, this.verb);
+    this.musicIn.connect(gain(0.22, this.musicVerb));
+    this.echo = c.createDelay(1); this.echo.delayTime.value = 0.34;
+    const fb = gain(0.36), damp = filt('lowpass', 2600);
+    this.echo.connect(damp); damp.connect(fb); fb.connect(this.echo); damp.connect(this.musicLP);
+    this.echoIn = gain(0.5, this.echo);
+    this.musicWet = gain(1, this.musicIn); // dry + echo send in one
+    this.musicWet.connect(this.echoIn);
+  },
+  // stereo noise tail with a darkening exponential decay — a big, dark room
+  impulse(dur) {
+    const c = this.ctx, n = Math.floor(c.sampleRate * dur), b = c.createBuffer(2, n, c.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = b.getChannelData(ch); let lp = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / n, k = 0.6 - t * 0.5; // smoothing grows with time: highs die first
+        lp += (Math.random() * 2 - 1 - lp) * k;
+        d[i] = i < c.sampleRate * 0.012 ? 0 : lp * Math.pow(1 - t, 3.2);
+      }
+    }
+    return b;
+  },
+  // ambient night wind: filtered noise with slowly wandering pitch and level
+  startWind() {
+    const c = this.ctx, src = c.createBufferSource(); src.buffer = this.bufs.white; src.loop = true;
+    const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 420; bp.Q.value = 1.1;
+    const g = c.createGain(); g.gain.value = 0;
+    g.gain.linearRampToValueAtTime(0.06, c.currentTime + 5);
+    const lfo = (f, depth, param) => {
+      const o = c.createOscillator(); o.frequency.value = f;
+      const d = c.createGain(); d.gain.value = depth; o.connect(d); d.connect(param); o.start();
+    };
+    lfo(0.07, 220, bp.frequency);
+    lfo(0.13, 0.025, g.gain);
+    src.connect(bp); bp.connect(g); g.connect(this.master); src.start();
+    this.windGain = g;
+  },
+  // storm level 0..1 and the current gust (around 1)
+  weather(level, gust) {
+    if (!this.ctx) return;
+    this.windGain.gain.setTargetAtTime(0.06 + 0.2 * level * level * gust, this.t(), 0.4);
+  },
+  // thunder: a long roll, louder the closer the strike (near: 0 far .. 1 overhead)
+  thunder(near) {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.45 + 0.45 * near, rnd(-0.4, 0.4), 0.5);
+    for (let i = 0; i < 4; i++) // overlapping rumbles, so it rolls rather than booms
+      this.nz(o, t + i * rnd(0.2, 0.6), { rate: 0.08, f: rnd(140, 320), dur: rnd(1.8, 4.2), v: rnd(0.5, 0.9), a: rnd(0.05, 0.3) });
+    this.duckMusic(0.55, 1.8);
+  },
+
+  // --- building blocks ---
+  // a per-sound output: gain → stereo pan → bus, plus a reverb send
+  out(v, pan = 0, wet = 0.15, bus = this.sfx) {
+    const c = this.ctx, g = c.createGain(); g.gain.value = v;
+    let n = g;
+    if (pan && c.createStereoPanner) {
+      const p = c.createStereoPanner(); p.pan.value = Math.max(-0.9, Math.min(0.9, pan));
+      g.connect(p); n = p;
+    }
+    n.connect(bus);
+    if (wet) { const s = c.createGain(); s.gain.value = wet; n.connect(s); s.connect(this.verb); }
+    return g;
+  },
+  // oscillator note. w: chip table name or native type. Percussive decay by default;
+  // pass `hold` (s) for a gated, sustained note. `vib` = vibrato depth in semitones.
+  osc(dest, at, { w = 'pulse50', f, f2, dur = 0.2, v = 1, a = 0.002, hold, vib = 0 }) {
+    const c = this.ctx, o = c.createOscillator(), g = c.createGain();
+    if (this.waves[w]) o.setPeriodicWave(this.waves[w]); else o.type = w;
+    o.frequency.setValueAtTime(f, at);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, at + (hold || dur));
+    if (vib) {
+      const l = c.createOscillator(), d = c.createGain();
+      l.frequency.value = 5.5; d.gain.setValueAtTime(0, at);
+      d.gain.linearRampToValueAtTime(f * (Math.pow(2, vib / 12) - 1), at + Math.min(0.25, (hold || dur) * 0.6));
+      l.connect(d); d.connect(o.frequency); l.start(at); l.stop(at + (hold || dur) + 0.1);
+    }
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(v, at + a);
+    let end;
+    if (hold) {
+      g.gain.setTargetAtTime(v * 0.6, at + a, hold * 0.4);
+      g.gain.setValueAtTime(v * 0.6, at + hold);   // anchor the release
+      g.gain.linearRampToValueAtTime(0, at + hold + 0.05);
+      end = at + hold + 0.06;
+    } else {
+      g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+      end = at + dur + 0.02;
+    }
+    o.connect(g); g.connect(dest); o.start(at); o.stop(end);
+  },
+  // filtered noise burst. buf: noise | metal | white; rate < 1 pitches the LFSR down (crunchier)
+  nz(dest, at, { buf = 'noise', rate = 1, type = 'lowpass', f = 2000, f2, q = 0.7, dur = 0.2, v = 1, a = 0.001 }) {
+    const c = this.ctx, s = c.createBufferSource(), fl = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.bufs[buf]; s.loop = true; s.playbackRate.value = rate;
+    fl.type = type; fl.Q.value = q;
+    fl.frequency.setValueAtTime(f, at);
+    if (f2) fl.frequency.exponentialRampToValueAtTime(f2, at + dur);
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(v, at + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    s.connect(fl); fl.connect(g); g.connect(dest);
+    s.start(at, Math.random() * s.buffer.duration * 0.9); s.stop(at + dur + 0.02);
+  },
+  // throaty zombie voice: two detuned saws through vowel formants, wobbling and sagging
+  growl(dest, at, { f, f2, dur, v, formant = 600, a = 0.08 }) {
+    const c = this.ctx, g = c.createGain(), f1 = c.createBiquadFilter(), fm = c.createBiquadFilter();
+    f1.type = 'bandpass'; f1.frequency.value = formant; f1.Q.value = 2.5;
+    fm.type = 'bandpass'; fm.frequency.value = formant * 1.8; fm.Q.value = 4;
+    const lfo = c.createOscillator(), ld = c.createGain();
+    lfo.frequency.value = rnd(5, 9); ld.gain.value = f * 0.06; lfo.connect(ld);
+    for (const det of [0, 9]) {
+      const o = c.createOscillator(); o.type = 'sawtooth'; o.detune.value = det;
+      o.frequency.setValueAtTime(f, at); o.frequency.exponentialRampToValueAtTime(f2, at + dur);
+      ld.connect(o.frequency); o.connect(f1); o.connect(fm);
+      o.start(at); o.stop(at + dur + 0.05);
+    }
+    lfo.start(at); lfo.stop(at + dur + 0.05);
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(v, at + a);
+    g.gain.setTargetAtTime(v * 0.7, at + a, dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    f1.connect(g); fm.connect(g); g.connect(dest);
+  },
+  // stereo position + distance falloff for something at world (x, z), relative to the player
+  place(pos) {
+    const dx = pos.x - player.position.x, dz = pos.z - player.position.z;
+    return { pan: dx / 12, near: 1 / (1 + Math.hypot(dx, dz) / 7) };
+  },
+  // pull the music down for a moment (impacts, stingers)
+  duckMusic(depth, dur) {
+    const g = this.duck.gain, t = this.t();
+    g.cancelScheduledValues(t); g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(depth, t + 0.03);
+    g.setTargetAtTime(1, t + dur, dur * 0.4);
+  },
+  // muffle the whole mix (concussion) — sounds on the `post` bus cut through
+  muffleFor(dur, freq) {
+    const f = this.muffle.frequency, t = this.t();
+    f.cancelScheduledValues(t); f.setValueAtTime(freq, t);
+    f.setTargetAtTime(20000, t + dur * 0.4, dur * 0.35);
+  },
+
+  // pause: sink the whole mix under a low muffle so the score keeps breathing quietly
+  pause(on) {
+    if (!this.ctx) return;
+    const t = this.t();
+    this.muffle.frequency.cancelScheduledValues(t);
+    this.muffle.frequency.setTargetAtTime(on ? 500 : 20000, t, on ? 0.08 : 0.15);
+    this.master.gain.setTargetAtTime(on ? 0.45 : 0.8, t, 0.1);
+  },
+
+  // --- SFX ---
+  shot(hot, spread) {
+    if (!this.ok()) return;
+    const t = this.t(), p = rnd(0.94, 1.06), o = this.out(0.8, 0, 0.12);
+    this.nz(o, t, { buf: 'white', type: 'highpass', f: 3500, dur: 0.025, v: 0.45 });            // crack
+    this.osc(o, t, { w: 'pulse25', f: 270 * p, f2: 55 * p, dur: 0.09, v: 0.3 });                  // chip body
+    this.osc(o, t, { w: 'sine', f: 140 * p, f2: 45, dur: 0.1, v: 0.55 });                          // punch
+    this.nz(o, t, { rate: 0.32 * p, f: 3400, f2: 260, dur: spread ? 0.3 : 0.2, v: 0.5 + spread * 0.06 }); // crunchy tail
+    if (hot) this.osc(o, t, { w: 'pulse12', f: 1100 * p, f2: 240, dur: 0.08, v: 0.13 });         // DOUBLE DAMAGE sizzle
+  },
+  hit(pos) {
+    if (!this.ok() || this.t() - this.lastHit < 0.03) return; // pierce/buckshot can hit many in one frame
+    const t = this.lastHit = this.t(), { pan, near } = this.place(pos), o = this.out(0.55 + near * 0.4, pan, 0.08);
+    this.nz(o, t, { rate: rnd(0.18, 0.28), type: 'bandpass', f: 1300, q: 1.3, dur: 0.07, v: 0.9 }); // wet slap
+    this.osc(o, t, { w: 'tri', f: rnd(190, 230), f2: 70, dur: 0.08, v: 0.6 });
+  },
+  zdeath(pos) {
+    if (!this.ok()) return;
+    const t = this.t(), p = rnd(0.85, 1.15), { pan, near } = this.place(pos), o = this.out(0.6 + near * 0.4, pan, 0.2);
+    this.growl(o, t, { f: 160 * p, f2: 48 * p, dur: 0.55, v: 0.5, formant: rnd(550, 800), a: 0.01 });
+    this.nz(o, t, { rate: 0.14, f: 1400, f2: 140, dur: 0.38, v: 0.7 });                            // splat
+    this.osc(o, t, { w: 'pulse12', f: 340 * p, f2: 85, dur: 0.12, v: 0.16 });                      // retro blip
+  },
+  groan(pos) {
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), f = rnd(70, 125), o = this.out(0.25 + near * 0.6, pan, 0.35);
+    this.growl(o, t, { f, f2: f * rnd(0.6, 0.85), dur: rnd(0.7, 1.4), v: 0.35, formant: 300 + near * 500, a: 0.15 });
+  },
+  swipe(pos) { // a zombie's blow catching only air
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), o = this.out(0.3 + near * 0.4, pan, 0.05);
+    this.nz(o, t, { buf: 'white', type: 'bandpass', f: 700, f2: 2400, q: 1.2, dur: 0.16, v: 0.5, a: 0.04 });
+  },
+  // doors and windows (pos = the opening)
+  bash(pos, v = 1) { // a blow on a plank door
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), o = this.out((0.4 + near * 0.5) * v, pan, 0.25);
+    this.osc(o, t, { w: 'sine', f: rnd(85, 100), f2: 45, dur: 0.2, v: 0.9 });
+    this.nz(o, t, { rate: 0.3, f: 900, f2: 250, dur: 0.14, v: 0.8 });
+    this.nz(o, t + 0.01, { buf: 'white', type: 'bandpass', f: rnd(1600, 2200), q: 3, dur: 0.05, v: 0.3 }); // split wood
+  },
+  crack(pos) { // the glass gives a little
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), o = this.out(0.3 + near * 0.4, pan, 0.2);
+    this.osc(o, t, { w: 'sine', f: 90, f2: 50, dur: 0.1, v: 0.5 });
+    this.nz(o, t, { buf: 'metal', type: 'highpass', f: 3500, dur: 0.07, v: 0.5 });
+    this.osc(o, t, { w: 'tri', f: 2400, f2: 1700, dur: 0.05, v: 0.15 });
+  },
+  shatter(pos) {
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), o = this.out(0.4 + near * 0.5, pan, 0.3);
+    this.nz(o, t, { buf: 'white', type: 'highpass', f: 2500, dur: 0.45, v: 0.6 });
+    this.nz(o, t, { buf: 'metal', type: 'bandpass', f: 6000, q: 1, dur: 0.3, v: 0.4 });
+    for (let i = 0; i < 9; i++) // shards tinkling down
+      this.osc(o, t + 0.05 + Math.random() * 0.5, { w: 'pulse12', f: rnd(2500, 5000), dur: 0.04, v: rnd(0.04, 0.09) });
+  },
+  doorBreak(pos) {
+    if (!this.ok()) return;
+    const t = this.t(), { pan, near } = this.place(pos), o = this.out(0.5 + near * 0.5, pan, 0.35);
+    this.nz(o, t, { buf: 'white', type: 'highpass', f: 1800, dur: 0.08, v: 0.5 });   // the crack
+    this.osc(o, t, { w: 'sine', f: 75, f2: 35, dur: 0.35, v: 0.9 });
+    this.nz(o, t, { rate: 0.25, f: 1500, f2: 180, dur: 0.45, v: 0.8 });
+    this.osc(o, t + 0.5, { w: 'sine', f: 62, f2: 30, dur: 0.28, v: 0.8 });           // ...and it slaps the floor
+    this.nz(o, t + 0.5, { rate: 0.2, f: 600, f2: 150, dur: 0.25, v: 0.7 });
+  },
+  hurt() {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(1, 0, 0.1, this.post);
+    this.osc(o, t, { w: 'sine', f: 95, f2: 28, dur: 0.45, v: 1 });                               // body blow
+    this.osc(o, t, { w: 'pulse50', f: 150, f2: 40, dur: 0.25, v: 0.3 });
+    this.nz(o, t, { rate: 0.1, f: 2600, f2: 180, dur: 0.35, v: 0.8 });
+    this.duckMusic(0.3, 0.6);
+    this.muffleFor(0.8, 650);
+  },
+  step() {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.22, 0, 0.05);
+    this.stepAlt = !this.stepAlt;
+    this.nz(o, t, { rate: 0.22, f: 520, dur: 0.05, v: 0.9 });                                       // boot on boards
+    this.osc(o, t, { w: 'tri', f: this.stepAlt ? 105 : 92, f2: 58, dur: 0.06, v: 0.7 });
+  },
+  reloadOut() {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.6, 0.15, 0.08);
+    this.nz(o, t, { buf: 'metal', rate: 0.6, type: 'highpass', f: 2200, dur: 0.035, v: 0.7 });   // release click
+    this.osc(o, t, { w: 'pulse12', f: 1300, f2: 820, dur: 0.025, v: 0.15 });
+    this.nz(o, t + 0.05, { type: 'bandpass', f: 900, f2: 600, q: 2, dur: 0.1, v: 0.4 });          // mag slides out
+  },
+  reloadIn() {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.65, 0.15, 0.1);
+    this.nz(o, t, { buf: 'metal', rate: 0.4, type: 'bandpass', f: 1500, q: 1.5, dur: 0.045, v: 0.9 }); // seat
+    this.osc(o, t, { w: 'tri', f: 320, f2: 150, dur: 0.05, v: 0.5 });
+    this.nz(o, t + 0.1, { buf: 'metal', rate: 0.8, type: 'highpass', f: 2800, dur: 0.03, v: 0.6 });   // rack
+    this.nz(o, t + 0.15, { buf: 'metal', rate: 0.55, type: 'highpass', f: 1800, dur: 0.04, v: 0.7 });
+    this.osc(o, t + 0.16, { w: 'pulse25', f: midiHz(86), dur: 0.06, v: 0.12 });                    // "ready" ping
+  },
+  pickup(id) {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.6, 0, 0.3);
+    const arps = { med: [62, 66, 69, 74, 78], dmg: [50, 57, 62, 69, 74], ammo: [69, 74, 78, 81, 86] };
+    (arps[id] || arps.med).forEach((m, i) => {
+      this.osc(o, t + i * 0.055, { w: id === 'dmg' ? 'pulse12' : 'pulse25', f: midiHz(m), dur: 0.18, v: 0.3 });
+      this.osc(o, t + i * 0.055, { w: 'tri', f: midiHz(m - 12), dur: 0.12, v: 0.25 });
+    });
+    this.nz(o, t, { buf: 'metal', rate: 1, type: 'highpass', f: 6000, dur: 0.4, v: 0.08 });       // shimmer
+  },
+
+  waveStart(n) {
+    music.setMode('combat');
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.6, 0, 0.6);
+    // tolling bell: inharmonic partials with slow beating
+    [[1, 1], [2.01, 0.5], [2.76, 0.4], [5.4, 0.2], [8.93, 0.1]].forEach(([r, v]) =>
+      this.osc(o, t, { w: 'sine', f: midiHz(50) * r, dur: 3.2 / Math.sqrt(r), v: v * 0.5, a: 0.005 }));
+    this.osc(o, t, { w: 'tri', f: midiHz(38), dur: 1.6, v: 0.5 });
+    // the classic horror semitone: A – Bb – A
+    if (n > 1) [57, 58, 57].forEach((m, i) => this.osc(o, t + 0.12 + i * 0.22, { w: 'pulse25', f: midiHz(m), hold: 0.18, v: 0.18 }));
+    this.duckMusic(0.35, 1.2);
+  },
+  waveClear() {
+    music.setMode('calm');
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.55, 0, 0.35);
+    // chip fanfare that resolves to D major — a moment of hope
+    [62, 66, 69, 74].forEach((m, i) => this.osc(o, t + i * 0.09, { w: 'pulse25', f: midiHz(m), hold: 0.08, v: 0.3 }));
+    this.osc(o, t + 0.36, { w: 'pulse25', f: midiHz(78), hold: 0.7, v: 0.3, vib: 0.3 });
+    this.osc(o, t + 0.36, { w: 'pulse12', f: midiHz(74), hold: 0.7, v: 0.15 });
+    this.osc(o, t, { w: 'tri', f: midiHz(50), hold: 1, v: 0.5 });
+    this.nz(o, t + 0.36, { buf: 'metal', type: 'highpass', f: 5000, dur: 1, v: 0.12 });
+    this.duckMusic(0, 1.4);
+  },
+  deal(count) {
+    if (!this.ok()) return;
+    const t = this.t();
+    for (let i = 0; i < count; i++) {
+      const o = this.out(0.4, (i - (count - 1) / 2) * 0.5, 0.1);
+      this.nz(o, t + 0.05 + i * 0.09, { buf: 'white', type: 'bandpass', f: 3200, f2: 1400, q: 1.5, dur: 0.07, v: 0.7 });
+      this.osc(o, t + 0.05 + i * 0.09, { w: 'pulse12', f: midiHz(74 + i * 5), dur: 0.05, v: 0.12 });
+    }
+  },
+  hover(i) {
+    if (!this.ok() || this.t() - this.lastHover < 0.05) return;
+    const t = this.lastHover = this.t();
+    this.osc(this.out(0.3, (i - 1) * 0.4, 0.1), t, { w: 'pulse12', f: midiHz(81 + i * 2), dur: 0.04, v: 0.25 });
+  },
+  upgrade(cat) {
+    if (!this.ok()) return;
+    const t = this.t(), o = this.out(0.55, 0, 0.35), up = { firepower: 0, handling: 2, survival: 5, fortune: 7 }[cat] || 0;
+    this.osc(o, t, { w: 'pulse12', f: 180, f2: 1700, dur: 0.3, v: 0.12 });                       // power-up sweep
+    [62, 69, 74, 78, 81].forEach((m, i) => this.osc(o, t + i * 0.05, { w: 'pulse25', f: midiHz(m + up), dur: 0.2, v: 0.25 }));
+  },
+  death() {
+    music.setMode('dead');
+    if (!this.ok()) return;
+    const t = this.t() + 0.35, o = this.out(0.6, 0, 0.45, this.post);
+    // the band sags into the floor, then the classic sad-trombone chromatic fall
+    [69, 68, 67].forEach((m, i) => this.osc(o, t + i * 0.32, { w: 'pulse25', f: midiHz(m), hold: 0.26, v: 0.28 }));
+    this.osc(o, t + 0.96, { w: 'pulse25', f: midiHz(66), f2: midiHz(61), hold: 1.3, v: 0.28, vib: 0.5 });
+    [57, 56, 55, 50].forEach((m, i) => this.osc(o, t + i * 0.32, { w: 'tri', f: midiHz(m - 12), hold: i < 3 ? 0.26 : 1.6, v: 0.5 }));
+    [[1, 1], [2.76, 0.4], [5.4, 0.2]].forEach(([r, v]) =>
+      this.osc(o, t + 0.96, { w: 'sine', f: midiHz(38) * r, dur: 3, v: v * 0.35, a: 0.005 }));
+  },
+  toggleMute() {
+    this.muted = !this.muted;
+    this.applyVolume();
+    return this.muted;
+  },
+  // the settings sliders run 0..10, where 8 is the mix as designed (10 is +4 dB, and the
+  // limiter catches it); squared so each step sounds like an even step
+  level() { return this.muted ? 0 : (settings.master / 8) ** 2; },
+  applyVolume() {
+    if (!this.ctx) return;
+    const t = this.t(), m = (settings.music / 8) ** 2;
+    this.mute.gain.setTargetAtTime(this.level(), t, 0.03);
+    this.musicVol.gain.setTargetAtTime(m, t, 0.03);
+    this.musicVerb.gain.setTargetAtTime(m, t, 0.03);
+  },
+  // menu blips: quiet and short
+  ui(kind) {
+    if (!this.ok() || this.t() - this.lastHover < 0.04) return;
+    const t = this.lastHover = this.t(), o = this.out(0.3, 0, 0.12);
+    if (kind === 'move') this.osc(o, t, { w: 'pulse12', f: midiHz(81), dur: 0.035, v: 0.2 });
+    else if (kind === 'back') this.osc(o, t, { w: 'pulse12', f: midiHz(74), f2: midiHz(69), dur: 0.07, v: 0.18 });
+    else [76, 83].forEach((m, i) => this.osc(o, t + i * 0.05, { w: 'pulse12', f: midiHz(m), dur: 0.06, v: 0.18 }));
+  },
+};
+
+// ===================================================================
+// MUSIC — an adaptive score in D minor for the chip voices, arranged like a modern
+// game soundtrack: extended chords voiced for smooth voice leading, one theme that
+// comes back in every mode (music box on the title, full band in the fight, major
+// key in the safe room), song forms that branch on how the fight is going, a
+// sidechained stereo pad, twin-lead harmony and drum fills. Sequenced in 16ths
+// with lookahead on the audio clock; mode changes land on the next beat.
+//   title   the theme on music-box bells over a slow pad, then harmonized, then an interlude
+//   combat  every 8 bars picks A (theme) / B (climax) / C (half-time breakdown) from the
+//           heat (wave + zombies alive), and layers 1-3 within each section
+//   calm    between waves: swung electric-piano comping, walking bass, the theme in F major
+//   dead    the band sags out, then the sting (audio.death)
+// ===================================================================
+// chords: [bass, ...pad voicing]. Mostly rootless voicings (the bass has the root),
+// picked so each voice moves a step or less into the next chord
+const CH = {
+  Dm9:       [38, 53, 57, 60, 64],  // F A C E
+  Dmadd9:    [38, 53, 57, 62, 64],  // F A D E
+  Bbmaj9:    [34, 53, 57, 60, 62],  // F A C D
+  Bbmaj7:    [34, 53, 58, 62, 69],  // F Bb D A
+  Bbmaj7s11: [34, 52, 57, 62, 65],  // E A D F
+  Gm9:       [43, 53, 58, 62, 69],  // F Bb D A
+  Gm7:       [43, 53, 58, 62, 67],  // F Bb D G
+  Eo7:       [40, 52, 55, 58, 62],  // E G Bb D
+  A7:        [45, 55, 61, 64, 69],  // G C# E A
+  A7b9:      [45, 55, 61, 64, 70],  // G C# E Bb — the b9 pulls hard back to D minor
+  Fmaj7:     [41, 53, 57, 60, 64],  // F A C E
+  Fmaj9:     [41, 55, 57, 60, 64],  // G A C E
+  Cadd9:     [36, 55, 60, 62, 64],  // G C D E
+  C69:       [36, 55, 57, 62, 64],  // G A D E
+  C7sus:     [36, 53, 55, 58, 60],  // F G Bb C
+  C7:        [36, 52, 55, 58, 60],  // E G Bb C
+  Am7:       [45, 55, 60, 64, 69],  // G C E A
+  Ebmaj7s11: [39, 55, 58, 62, 69],  // G Bb D A — Neapolitan, the darkest turn in the score
+};
+// melodies: [16th step in the 8-bar section, midi note, length in 16ths]
+const tune = notes => new Map(notes.map(([s, m, l]) => [s, { m, l }]));
+const THEME = tune([ // the main theme, everywhere in D minor
+  [0, 69, 4], [4, 74, 2], [6, 77, 2], [8, 76, 6], [14, 74, 2],
+  [16, 77, 4], [20, 74, 4], [24, 70, 8],
+  [32, 67, 2], [34, 70, 2], [36, 74, 4], [40, 79, 6], [46, 77, 2],
+  [48, 76, 4], [52, 73, 4], [56, 69, 8],
+  [64, 69, 4], [68, 74, 2], [70, 77, 2], [72, 81, 6], [78, 79, 2],
+  [80, 77, 4], [84, 81, 4], [88, 84, 4], [92, 81, 4],
+  [96, 79, 4], [100, 77, 2], [102, 74, 2], [104, 70, 4], [108, 74, 4],
+  [112, 73, 4], [116, 76, 4], [120, 81, 4], [124, 73, 4],
+]);
+const SOAR = tune([ // the climax: long lines climbing to the b9 over the dominant
+  [0, 74, 6], [6, 72, 2], [8, 74, 4], [12, 77, 4],
+  [16, 76, 8], [24, 74, 4], [28, 72, 4],
+  [32, 72, 4], [36, 76, 4], [40, 81, 8],
+  [48, 79, 4], [52, 77, 4], [56, 76, 4], [60, 74, 4],
+  [64, 74, 6], [70, 72, 2], [72, 74, 4], [76, 81, 4],
+  [80, 79, 8], [88, 76, 4], [92, 79, 4],
+  [96, 82, 8], [104, 81, 4], [108, 79, 4],
+  [112, 82, 4], [116, 81, 12],
+]);
+const OMEN = tune([ // the breakdown: the wave bell's A–Bb–A, then a climb back into the fight
+  [0, 81, 12], [12, 82, 4], [16, 81, 16],
+  [32, 79, 6], [38, 77, 2], [40, 74, 8], [48, 76, 16],
+  [64, 81, 12], [76, 82, 4], [80, 81, 16],
+  [96, 82, 8], [104, 81, 4], [108, 79, 4],
+  [112, 73, 4], [116, 76, 4], [120, 79, 4], [124, 82, 4],
+]);
+const HAVEN = tune([ // the theme's shape in F major for the safe room, left hanging on the b9
+  [0, 76, 6], [6, 74, 2], [8, 72, 8],
+  [16, 72, 4], [20, 76, 4], [24, 79, 8],
+  [32, 77, 6], [38, 76, 2], [40, 74, 8],
+  [48, 72, 4], [52, 77, 4], [56, 76, 8],
+  [64, 81, 6], [70, 79, 2], [72, 77, 8],
+  [80, 76, 4], [84, 77, 4], [88, 81, 8],
+  [96, 82, 6], [102, 81, 2], [104, 79, 4], [108, 77, 4],
+  [112, 76, 4], [116, 73, 4], [120, 70, 8],
+]);
+// 8-bar sections: one or two chords a bar (two = a change at the half bar)
+const SECTIONS = {
+  A: { bars: [['Dm9'], ['Bbmaj9'], ['Gm9'], ['A7', 'A7b9'], ['Dmadd9'], ['Fmaj7'], ['Gm7', 'Eo7'], ['A7b9']], mel: THEME },
+  B: { bars: [['Bbmaj7'], ['Cadd9'], ['Am7'], ['Dm9'], ['Bbmaj7'], ['C69'], ['Ebmaj7s11'], ['A7b9']], mel: SOAR },
+  C: { bars: [['Dmadd9'], ['Bbmaj7s11'], ['Gm9'], ['Dm9'], ['Dmadd9'], ['Ebmaj7s11'], ['Gm7'], ['A7b9']], mel: OMEN, pedal: 38 },
+  I: { bars: [['Bbmaj7'], ['Gm9'], ['Ebmaj7s11'], ['Dmadd9'], ['Bbmaj7s11'], ['Gm9'], ['Eo7'], ['A7b9']] }, // title interlude
+  F: { bars: [['Fmaj9'], ['Am7'], ['Bbmaj7'], ['C7sus', 'C7'], ['Fmaj9'], ['Dm9'], ['Gm9'], ['A7b9']], mel: HAVEN },
+};
+// a second voice under a melody note: the nearest chord tone at least a minor third below
+function harmonyUnder(m, chord) {
+  for (let t = m - 3; t >= m - 9; t--) if (chord.some(c => (c - t) % 12 === 0)) return t;
+  return null;
+}
+const ARP_UPDOWN = [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1, 2, 3];
+const hum = v => v * (0.9 + Math.random() * 0.2); // a little velocity life
+
+const music = {
+  mode: 'off', pending: null, step: 0, next: 0, timer: null, layer: 1, lowHp: false,
+  sec: 'A', secN: 0, vary: false, // current section, sections played in this mode, second-pass variation
+  lead: null,                      // last lead note { m, end }, for legato glides
+  wave: 0, alive: 0,               // fed by the game loop
+  start() {
+    const c = audio.ctx;
+    // persistent voice buses, each panned into the music chain
+    const bus = (pan, to, v = 1) => {
+      const g = c.createGain(); g.gain.value = v;
+      if (pan && c.createStereoPanner) { const p = c.createStereoPanner(); p.pan.value = pan; g.connect(p); p.connect(to); }
+      else g.connect(to);
+      return g;
+    };
+    // sidechain: pads and arps duck under every kick, so the low end breathes
+    this.pump = bus(0, audio.musicIn);
+    this.pumpWet = bus(0, audio.musicWet);
+    this.padLP = [-0.55, 0.55].map(pan => {
+      const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900; f.Q.value = 0.9;
+      f.connect(bus(pan, this.pump));
+      return f;
+    });
+    this.arp = [bus(-0.35, this.pumpWet), bus(0.35, this.pumpWet)];
+    this.leadBus = bus(0.08, audio.musicWet);
+    this.harmBus = bus(-0.22, audio.musicWet);
+    this.bellBus = bus(0.15, audio.musicWet);
+    this.keysBus = bus(-0.1, audio.musicWet);
+    this.bassBus = bus(0, audio.musicIn);
+    this.kit = bus(0, audio.musicIn);
+    this.hatBus = bus(0.25, audio.musicIn);
+    this.crashBus = bus(-0.3, audio.musicIn);
+    this.next = audio.t() + 0.1;
+    this.timer = setInterval(() => this.tick(), 25);
+    this.setMode('title');
+  },
+  setMode(m) {
+    if (!audio.ctx || m === (this.pending || this.mode)) return;
+    if (m !== 'dead') { this.pending = m; return; } // lands on the next beat (see advance)
+    this.pending = null;
+    this.mode = 'dead';
+    const t = audio.t();
+    audio.musicLP.frequency.cancelScheduledValues(t);
+    audio.musicLP.frequency.setTargetAtTime(120, t, 0.25);
+    audio.duck.gain.cancelScheduledValues(t);
+    audio.duck.gain.setTargetAtTime(0, t, 0.3);
+    clearTimeout(this.reviveT);
+    this.reviveT = setTimeout(() => this.setMode('title'), 4200);
+  },
+  // switch modes on a beat, starting the new mode's score from the top
+  enter(m) {
+    this.pending = null;
+    if (m === this.mode) return;
+    const prev = this.mode;
+    this.mode = m;
+    this.step = 0; this.secN = 0; this.lead = null;
+    clearTimeout(this.reviveT);
+    if (prev === 'dead') audio.duck.gain.setTargetAtTime(1, audio.t(), 0.8);
+    this.filter();
+  },
+  // music lowpass: wide open, darker between waves, choked while you're on your last heart
+  filter() {
+    const f = this.mode === 'dead' ? 120 : this.lowHp ? 900 : this.mode === 'calm' ? 6000 : 18000;
+    audio.musicLP.frequency.setTargetAtTime(f, audio.t(), 0.4);
+  },
+  heat() { return 0.1 + this.wave * 0.06 + this.alive / 30 * 0.6; },
+  bpm() {
+    if (this.mode === 'combat') return Math.min(156, 126 + this.wave * 2);
+    return this.mode === 'calm' ? 92 : 76;
+  },
+  swing() { return this.mode === 'calm' ? 0.16 : this.mode === 'title' ? 0.06 : 0; },
+  sixteenth() { return 60 / this.bpm() / 4; },
+  dur(steps) { return steps * this.sixteenth(); },
+  tick() {
+    const c = audio.ctx;
+    if (!c || c.state !== 'running') return;
+    const lowHp = this.mode === 'combat' && this.lowHp;
+    if (lowHp !== this._lowHp) { this._lowHp = lowHp; this.filter(); }
+    audio.echo.delayTime.setTargetAtTime(this.sixteenth() * 3, c.currentTime, 0.1); // dotted-8th echo
+    if (this.next < c.currentTime) this.next = c.currentTime + 0.02; // fell behind (tab was hidden)
+    while (this.next < c.currentTime + 0.12) this.advance();
+  },
+  advance() {
+    if (this.pending && this.step % 4 === 0) this.enter(this.pending);
+    const swing = this.step % 2 ? this.swing() * this.sixteenth() : 0; // late off-beats
+    if (!audio.muted && this.mode !== 'dead' && this.mode !== 'off') this.play(this.step, this.next + swing);
+    this.next += this.sixteenth();
+    this.step++;
+  },
+  // which 8-bar section comes next. The fight goes A → B → A' → (C, or B' when it's hot)
+  pickSection() {
+    const n = this.secN++;
+    if (this.mode === 'title') { this.sec = n % 3 === 2 ? 'I' : 'A'; this.vary = n % 3 === 1; return; }
+    if (this.mode === 'calm') { this.sec = 'F'; this.vary = n % 2 === 1; return; }
+    const k = n % 4;
+    this.sec = k === 1 ? 'B' : k === 3 ? (this.heat() >= 0.55 ? 'B' : 'C') : 'A';
+    this.vary = k >= 2;
+  },
+
+  // --- instruments ---
+  // one enveloped oscillator: attack `a`, optional decay toward decay[0]×v (time constant
+  // decay[1]), held for `len`, released over ~r. `from` glides in from another note.
+  voice(dest, at, { w = 'pulse25', m, len, v, a = 0.005, r = 0.08, vib = 0, from, det = 0, decay }) {
+    const c = audio.ctx, o = c.createOscillator(), g = c.createGain(), f = midiHz(m);
+    if (audio.waves[w]) o.setPeriodicWave(audio.waves[w]); else o.type = w;
+    o.detune.value = det;
+    if (from !== undefined) { o.frequency.setValueAtTime(midiHz(from), at); o.frequency.exponentialRampToValueAtTime(f, at + 0.05); }
+    else o.frequency.setValueAtTime(f, at);
+    if (vib && len > 0.3) { // delayed vibrato, like a held note on a real instrument
+      const l = c.createOscillator(), d = c.createGain();
+      l.frequency.value = 5.2; d.gain.setValueAtTime(0, at + 0.18);
+      d.gain.linearRampToValueAtTime(f * (Math.pow(2, vib / 12) - 1), at + Math.min(len, 0.5));
+      l.connect(d); d.connect(o.frequency); l.start(at); l.stop(at + len + r * 2);
+    }
+    const end = at + Math.max(len, a);
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(v, at + a);
+    if (decay) g.gain.setTargetAtTime(v * decay[0], at + a, decay[1]);
+    g.gain.setTargetAtTime(0, end, r / 3);
+    o.connect(g); g.connect(dest); o.start(at); o.stop(end + r * 2);
+  },
+  // stereo pad: a 25% and a 50% pulse per note, detuned apart and split left/right
+  pad(at, notes, steps, v, a) {
+    for (const m of notes) [0, 1].forEach(k =>
+      this.voice(this.padLP[k], at, { w: k ? 'pulse50' : 'pulse25', m, len: this.dur(steps), v, a, r: 0.7, det: k ? 8 : -8 }));
+  },
+  padTone(at, f) { for (const lp of this.padLP) lp.frequency.setTargetAtTime(f, at, 0.4); },
+  bass(at, m, steps, v) {
+    const len = this.dur(steps) * 0.85;
+    this.voice(this.bassBus, at, { w: 'tri', m, len, v, a: 0.004, r: 0.05 });
+    this.voice(this.bassBus, at, { w: 'sine', m, len, v: v * 0.5, a: 0.004, r: 0.05 }); // body under the 4-bit grit
+  },
+  leadNote(at, m, steps, v, { bus = this.leadBus, w = 'pulse25', vib = 0.22 } = {}) {
+    // long legato notes slide in from the last one
+    const l = this.lead, glide = l && steps >= 4 && Math.abs(at - l.end) < 0.04 && Math.abs(m - l.m) <= 5 ? l.m : undefined;
+    this.voice(bus, at, { w, m, len: this.dur(steps) * 0.92, v, a: 0.01, r: 0.12, vib: steps >= 4 ? vib : 0, from: glide });
+    if (bus === this.leadBus) this.lead = { m, end: at + this.dur(steps) };
+  },
+  // music-box tine: a bright strike that rings down, with a quick metallic overtone
+  bell(at, m, v) {
+    this.voice(this.bellBus, at, { w: 'sine', m, len: 0.01, v, a: 0.002, r: 1.8 });
+    this.voice(this.bellBus, at, { w: 'sine', m: m + 12, len: 0.01, v: v * 0.3, a: 0.002, r: 0.5 });
+    this.voice(this.bellBus, at, { w: 'tri', m: m + 24, len: 0.01, v: v * 0.1, a: 0.001, r: 0.12 });
+  },
+  // electric piano: a sine that blooms and settles, with a little tine bark on top
+  keys(at, m, steps, v) {
+    this.voice(this.keysBus, at, { w: 'sine', m, len: this.dur(steps), v, a: 0.004, r: 0.5, decay: [0.45, 0.4] });
+    this.voice(this.keysBus, at, { w: 'tri', m: m + 12, len: 0.04, v: v * 0.16, a: 0.002, r: 0.2 });
+  },
+  kick(at, v = 0.9) {
+    audio.osc(this.kit, at, { w: 'sine', f: 160, f2: 44, dur: 0.18, v });
+    audio.nz(this.kit, at, { buf: 'white', type: 'highpass', f: 2500, dur: 0.012, v: v * 0.22 }); // beater click
+    for (const p of [this.pump, this.pumpWet]) { p.gain.setValueAtTime(0.3, at); p.gain.setTargetAtTime(1, at + 0.03, 0.09); }
+  },
+  snare(at, v = 0.5) {
+    audio.nz(this.kit, at, { rate: 0.55, type: 'bandpass', f: 2200, q: 0.8, dur: 0.16, v });
+    audio.osc(this.kit, at, { w: 'tri', f: 230, f2: 150, dur: 0.07, v: v * 0.6 });
+  },
+  hat(at, v = 0.12, open = false) {
+    audio.nz(this.hatBus, at + (Math.random() - 0.5) * 0.004, { buf: 'metal', type: 'highpass', f: 7000, dur: open ? 0.2 : 0.035, v: hum(v) });
+  },
+  brush(at, v) { audio.nz(this.hatBus, at, { buf: 'white', type: 'bandpass', f: 3500, q: 0.7, dur: 0.14, v: hum(v), a: 0.03 }); },
+  crash(at, v = 0.22) {
+    audio.nz(this.crashBus, at, { buf: 'white', type: 'highpass', f: 4500, dur: 1.8, v });
+    audio.nz(this.crashBus, at, { buf: 'metal', type: 'highpass', f: 8000, dur: 1.1, v: v * 0.4 });
+  },
+  tom(at, f, v = 0.6) { audio.osc(this.kit, at, { w: 'sine', f, f2: f * 0.55, dur: 0.22, v }); },
+  // filtered noise swelling into the next downbeat
+  riser(at, len, v) {
+    const c = audio.ctx, s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = audio.bufs.white; s.loop = true;
+    f.type = 'bandpass'; f.Q.value = 1.4;
+    f.frequency.setValueAtTime(300, at); f.frequency.exponentialRampToValueAtTime(6000, at + len);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(v, at + len);
+    g.gain.linearRampToValueAtTime(0, at + len + 0.03);
+    s.connect(f); f.connect(g); g.connect(this.crashBus); s.start(at); s.stop(at + len + 0.05);
+  },
+  heart(at) {
+    const o = audio.out(0.9, 0, 0, audio.post);
+    audio.osc(o, at, { w: 'sine', f: 62, f2: 40, dur: 0.14, v: 1 });
+    audio.osc(o, at + 0.16, { w: 'sine', f: 55, f2: 38, dur: 0.12, v: 0.7 });
+  },
+
+  play(step, at) {
+    if (step % 128 === 0) this.pickSection();
+    const s = step % 16, bar = (step >> 4) % 8, sec = SECTIONS[this.sec];
+    const chords = sec.bars[bar], ch = CH[chords[s < 8 ? 0 : chords.length - 1]];
+    const bassOf = b => sec.pedal && b < 7 ? sec.pedal : CH[sec.bars[b][0]][0];
+    const g = {
+      s, bar, sec, ch, pad: ch.slice(1), root: bassOf(bar), bassOf,
+      change: s === 0 || (s === 8 && chords.length === 2), // a chord lands here
+      span: chords.length === 2 ? 8 : 16,                   // ...and lasts this many 16ths
+      mel: sec.mel?.get(step % 128),
+    };
+    if (this.mode === 'title') this.playTitle(at, g);
+    else if (this.mode === 'calm') this.playCalm(at, g);
+    else this.playCombat(at, g);
+  },
+
+  playTitle(at, { s, ch, pad, root, change, span, mel }) {
+    // a slow pad and a held low root under everything
+    if (change) { this.pad(at, pad, span, 0.026, 0.9); this.padTone(at, 1100); }
+    if (s === 0) this.voice(this.bassBus, at, { w: 'tri', m: root, len: this.dur(15), v: 0.28, a: 0.3, r: 0.8 });
+    if (this.sec === 'I') {
+      // interlude: stray chimes picked from the chord, high and far apart
+      if (s % 6 === 3 && Math.random() < 0.6) this.bell(at, pad[(Math.random() * 4) | 0] + 12, 0.08);
+      return;
+    }
+    if (mel) {
+      this.bell(at, mel.m, 0.27);
+      if (this.vary) { const h = harmonyUnder(mel.m, ch); if (h) this.bell(at + 0.012, h, 0.12); } // second pass: in harmony
+    }
+    if (this.vary && s % 4 === 2) this.voice(this.arp[(s >> 2) & 1], at, { w: 'pulse12', m: pad[(s >> 2) % 4] + 12, len: this.dur(2), v: 0.035 });
+  },
+
+  playCalm(at, { s, bar, ch, pad, root, bassOf, change, span, mel }) {
+    // electric piano comping: a rolled chord on the change, a short stab on the "and" of 3
+    if (change) pad.forEach((m, i) => this.keys(at + i * 0.018, m, span, hum(0.05)));
+    else if (s === 10 && span === 16) pad.forEach((m, i) => this.keys(at + i * 0.012, m, 2, hum(0.032)));
+    if (change) this.pad(at, pad, span, 0.008, 0.4);
+    if (s === 0) this.padTone(at, 1400);
+    // walking bass: root, fifth, octave, then a half step into the next bar's root
+    if (s % 4 === 0) {
+      const next = bassOf((bar + 1) % 8);
+      this.bass(at, [root, root + 7, root + 12, next > root ? next - 1 : next + 1][s >> 2], 4, hum(0.24));
+    }
+    // brushes: swept backbeat, ticking quarters
+    if (s === 4 || s === 12) this.brush(at, 0.05);
+    if (s % 4 === 0) this.hat(at, 0.035);
+    else if (s % 2 === 0) this.hat(at, 0.02);
+    // the theme in F major on the first pass; the second leaves room for the keys
+    if (mel && !this.vary) this.leadNote(at, mel.m, mel.l, 0.13, { w: 'tri', vib: 0.15 });
+  },
+
+  playCombat(at, { s, bar, ch, pad, root, bassOf, change, span, mel }) {
+    // pick the arrangement layer at each bar line so changes land on the beat
+    if (s === 0) { const h = this.heat(); this.layer = h < 0.35 ? 1 : h < 0.7 ? 2 : 3; }
+    const L = this.layer, half = this.sec === 'C', last = bar === 7;
+    // pad: opens up with the layer; the breakdown sweeps it open across its 8 bars
+    if (change) this.pad(at, pad, span, 0.014 + 0.007 * L, 0.06);
+    if (s === 0) this.padTone(at, half ? 500 + bar * 320 : 650 + L * 650);
+    if (s === 0 && bar === 0 && this.secN > 1 && L >= 2) this.crash(at);
+
+    if (half) {
+      // --- breakdown: half time, a pedal in the bass, the omen on the bells ---
+      if (s === 0) this.bass(at, root, 16, 0.42);
+      if (last && s % 2 === 0) this.bass(at, root + 12 * ((s >> 1) & 1), 2, 0.35); // pumps back up into the fight
+      if (s === 0 || (L >= 2 && s === 11)) this.kick(at, 0.85);
+      if (s === 8 && !last) this.snare(at, 0.55);
+      if (s % 4 === 2) this.hat(at, 0.07);
+      if (last) {
+        if (s === 0) this.riser(at, this.dur(16), 0.18);
+        if (s >= 8 || s % 2 === 0) this.snare(at, 0.12 + s * 0.02); // roll, building
+      }
+      if (mel) this.bell(at, mel.m, 0.2);
+      if (this.lowHp && s % 4 === 0) this.heart(at);
+      return;
+    }
+
+    // --- bass: octave-jumping 8ths, galloping 16ths at full intensity, and a
+    // chromatic step into the next bar's root on the last 8th ---
+    const gallop = [1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1];
+    if (L < 3 ? s % 2 === 0 : gallop[s]) {
+      let m = root + (s % 4 === 2 ? 12 : 0);
+      if (s === 14 && !last) { const nb = bassOf(bar + 1); if (nb !== root) m = nb + (nb > root ? -1 : 1); }
+      this.bass(at, m, L < 3 ? 2 : 1, hum(0.3 + 0.03 * L));
+    }
+
+    // --- drums, with a tom fill into each new section ---
+    const fill = last && s >= 12 && L >= 2;
+    if (fill) this.tom(at, [200, 165, 135, 105][s - 12]);
+    else {
+      if (s === 0 || s === 8 || (L >= 2 && s === 10) || (L >= 3 && s === 3)) this.kick(at);
+      if (L >= 2 && (s === 4 || s === 12)) this.snare(at, hum(0.5));
+      if (L >= 3 && (s === 7 || s === 15)) this.snare(at, hum(0.1)); // ghost notes
+      const open = this.sec === 'B' && L >= 2 && s % 4 === 2;
+      if (L >= 3 || s % 2 === 0) this.hat(at, open ? 0.1 : s % 4 === 2 ? 0.16 : 0.08, open);
+    }
+
+    // --- arpeggio over the pad voicing, ping-ponging across the stereo field ---
+    const arp = [...pad, ...pad.map(n => n + 12)];
+    if (L === 1 ? s % 4 === 2 : L === 2 ? s % 2 === 0 : true) {
+      const i = L === 1 ? 4 + ((s >> 2) & 3) : L === 2 ? (s >> 1) : ARP_UPDOWN[s];
+      this.voice(this.arp[s & 2 ? 1 : 0], at + (Math.random() - 0.5) * 0.004, { w: 'pulse12', m: arp[i], len: this.dur(L === 3 ? 1 : 2) * 0.8, v: hum(0.042), r: 0.05 });
+    }
+
+    // --- the tune: soft triangle at layer 1, the pulse lead from 2, doubled an octave
+    // down at 3, and a twin-lead harmony on second passes and in the climax ---
+    if (mel) {
+      if (L === 1) this.leadNote(at, mel.m, mel.l, 0.12, { w: 'tri' });
+      else this.leadNote(at, mel.m, mel.l, 0.18);
+      if (L >= 3) this.voice(this.leadBus, at, { w: 'pulse50', m: mel.m - 12, len: this.dur(mel.l) * 0.9, v: 0.06, r: 0.1 });
+      if (L >= 2 && (this.vary || this.sec === 'B')) {
+        const h = harmonyUnder(mel.m, ch);
+        if (h) this.leadNote(at, h, mel.l, 0.09, { bus: this.harmBus, w: 'pulse50', vib: 0.15 });
+      }
+    }
+    if (this.lowHp && s % 4 === 0) this.heart(at);
+  },
+};
+
+// Start the title music as soon as the page loads. Browsers block audio until the
+// first click or keypress, which is what the title's PRESS ANY KEY splash collects.
+audio.ensure();
+function initAudio() {
+  audio.ensure();
+  ['click', 'keydown', 'touchstart'].forEach(e => document.removeEventListener(e, initAudio));
+}
+['click', 'keydown', 'touchstart'].forEach(e => document.addEventListener(e, initAudio));
+// park the audio clock while the tab is hidden so the score doesn't stutter
+document.addEventListener('visibilitychange', () => {
+  if (!audio.ctx) return;
+  if (document.hidden) audio.ctx.suspend(); else audio.ctx.resume();
+});
+
+// ===================================================================
+// WORLD: forest floor, plank floor, log walls (with gaps), yard, forest, lights
+// ===================================================================
+const HALF = 10;            // interior half-extent (cabin is 20x20)
+const WALL_H = 2.4;
+const WALL_T = 0.7;
+
+const world = new THREE.Group();
+scene.add(world);
+
+// Everything static is baked from blocks into a few vertex-colored meshes
+// (floor, walls, props) plus instanced trees and undergrowth, so the whole
+// set is a couple of dozen draw calls.
+const worldMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92 });
+const GROUND_Y = -0.06; // the forest floor sits just under the cabin boards
+function bakedMesh(batch, cast = true) {
+  const m = new THREE.Mesh(batch.build(), worldMat);
+  m.castShadow = cast; m.receiveShadow = true;
+  world.add(m);
+  return m;
+}
+// a matrix placing a prop at (x, z), turned ry
+const _place = new THREE.Matrix4();
+const at = (x, z, ry = 0, y = 0) => _place.makeRotationY(ry).setPosition(x, y, z);
+
+// --- forest floor: blocky flecks of moss, needles and dirt on a small repeating texture ---
+function groundTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d'), rng = seeded(5);
+  g.fillStyle = '#1b1e15';
+  g.fillRect(0, 0, 128, 128);
+  const tones = ['#232b19', '#161812', '#2a2418', '#1e2716', '#121410', '#2c3320'];
+  for (let i = 0; i < 2600; i++) {
+    g.fillStyle = tones[(rng() * tones.length) | 0];
+    const s = rng() < 0.85 ? 2 : 4;
+    g.fillRect((rng() * 64 | 0) * 2, (rng() * 64 | 0) * 2, s, s);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(25, 25);
+  t.magFilter = THREE.NearestFilter;
+  t.anisotropy = 4;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ map: groundTexture(), roughness: 1 }));
+ground.position.y = GROUND_Y;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// --- cabin floor: staggered boards, each its own shade; the chamfers draw the seams ---
+const floorBase = new THREE.Mesh(new THREE.BoxGeometry(HALF * 2 + WALL_T, 0.4, HALF * 2 + WALL_T),
+  new THREE.MeshStandardMaterial({ color: 0x150f0a, roughness: 1 }));
+floorBase.position.y = -0.28;
+floorBase.receiveShadow = true;
+world.add(floorBase);
+
+const EDGE = HALF + WALL_T / 2, BOARD = 0.42;
+const floorB = new BlockBatch(), frng = seeded(11);
+const boardTones = [0x4d3825, 0x46321f, 0x533d28, 0x41301e];
+for (let z = -EDGE + BOARD / 2; z < EDGE; z += BOARD) {
+  for (let x = -EDGE - frng() * 2; x < EDGE;) {
+    const len = 1.6 + frng() * 2.6, a = Math.max(x, -EDGE), b = Math.min(x + len, EDGE), r = frng();
+    const tone = r < 0.05 ? 0x2e2115 : r < 0.1 ? 0x5e4730 : boardTones[(frng() * 4) | 0]; // the odd stained or newer board
+    floorB.add([[b - a - 0.015, 0.08, BOARD - 0.015, (a + b) / 2, -0.04, z, tone, 0, 0, 0, 0.018]], frng);
+    x += len;
+  }
+}
+// a braided rug, stepped into an oval (each ring a little higher so they never z-fight)
+[[3.8, 2.2, 3.2, 2.7, 0x55201c], [3.2, 1.6, 2.6, 2.1, 0x6a5432], [2.6, 1.0, 2.0, 1.5, 0x55201c], [1.7, 0.45, 1.3, 0.75, 0x3e2618]]
+  .forEach(([w1, d1, w2, d2, c], i) => floorB.add([
+    [w1, 0.012, d1, 0, 0.006 + i * 0.008, 0, c, 0, 0, 0, 0.004],
+    [w2, 0.012, d2, 0, 0.009 + i * 0.008, 0, c, 0, 0, 0, 0.004],
+  ], frng, at(3, -2.6, 0.08)));
+// what was left behind: loose pages, a tin can, old blood dragged in from the door
+for (const [x, z, ry] of [[-6.5, -7.8, 0.4], [-6.1, -7.4, 1.3], [7.2, 6.4, 2.2], [-8.2, 3.2, 0.9], [1.2, 7.9, 2.8]]) {
+  floorB.add([[0.22, 0.006, 0.3, 0, 0.004, 0, 0xb5ab90, 0, 0, 0, 0.002]], frng, at(x, z, ry));
+}
+floorB.add([[0.13, 0.13, 0.17, 0, 0.065, 0, 0x8a8f96, 0, 0, 0, 0.02], [0.135, 0.07, 0.1, 0, 0.065, 0.02, 0x9a3a2a, 0, 0, 0, 0.01]], frng, at(-3.5, 6.2, 0.7));
+for (const [x, z, w, ry] of [[0.4, 8.9, 0.9, 0.2], [-0.5, 8.1, 0.6, -0.4], [0.9, 7.3, 0.5, 0.6]]) {
+  floorB.add([[w, 0.006, w * 0.45, 0, 0.004, 0, 0x2a0b09, 0, 0, 0, 0.002]], frng, at(x, z, ry));
+}
+
+// --- walls: stacked logs with chinking and overhanging corners, two doors and three windows ---
+// The openings are where zombies get in: they break the doors down and smash and climb the windows.
+const openings = []; // the doors and windows (see makeOpening)
+const wallBoxes = []; // world-space {minX, maxX, minZ, maxZ} footprints for bullet collision
+const wallB = new BlockBatch(), wrng = seeded(23);
+const LOG_STEP = 0.4, LOG_H = 0.42, LOG_D = 0.62, OVERHANG = 0.42;
+const LOG_TONES = [0x5a4430, 0x4d3926, 0x664e36, 0x45331f];
+const END_GRAIN = 0x8d7150, CHINK = 0x9a9486, POST = 0x3a2b1d, WEATHERED = 0x6d6352;
+const STONE_TONES = [0x3d3e40, 0x46464a, 0x353638];
+// a block lying along a wall: `u0..u1` along it, centered `n` off the wall plane
+function wallBlock(axis, fixed, u0, u1, y, h, d, color, bevel, n = 0, tilt = 0) {
+  const len = Math.abs(u1 - u0), c = (u0 + u1) / 2;
+  return axis === 'x'
+    ? [len, h, d, c, y, fixed + n, color, 0, 0, tilt, bevel]
+    : [d, h, len, fixed + n, y, c, color, -tilt, 0, 0, bevel];
+}
+
+// builds a wall along an axis. `fixed` = the constant coord, `axis` = 'x' or 'z';
+// `gaps` = [start, end, 'door' | 'window'] along the moving axis (world units)
+const OPENING_INSET = 1.5; // how far in/out the entry waypoints sit from the wall plane
+const SILL = { x: 0.85, z: 1.05 }, HEAD = { x: 1.63, z: 1.83 }; // window openings fall between log courses
+const DOOR_TOP = 2.03, JAMB = 0.14;
+const DOOR_HP = 12, WINDOW_HP = 2; // blows it takes to break one in
+function buildWall(axis, fixed, gaps) {
+  const min = -EDGE, max = EDGE, mine = [];
+  const segs = [];
+  let cursor = min;
+  for (const [gs, ge, kind] of gaps.slice().sort((a, b) => a[0] - b[0])) {
+    if (gs > cursor) segs.push([cursor, gs]);
+    cursor = Math.max(cursor, ge);
+    mine.push(makeOpening(axis, fixed, gs, ge, kind));
+  }
+  if (cursor < max) segs.push([cursor, max]);
+  const layer0 = axis === 'x' ? 0.24 : 0.44; // the two directions interleave at the corners
+  for (const [a, b] of segs) {
+    const hw = (axis === 'x' ? b - a : WALL_T) / 2, hd = (axis === 'x' ? WALL_T : b - a) / 2;
+    const cx = axis === 'x' ? (a + b) / 2 : fixed, cz = axis === 'x' ? fixed : (a + b) / 2;
+    wallBoxes.push({ minX: cx - hw, maxX: cx + hw, minZ: cz - hd, maxZ: cz + hd });
+    logRun(axis, fixed, a, b, layer0, () => true, a > min + 0.01, b < max - 0.01, true);
+  }
+  // across each opening: a lintel over a door; logs under the sill and over the head of a window
+  for (const o of mine) {
+    const keep = o.kind === 'door'
+      ? y => y - LOG_H / 2 >= DOOR_TOP - 0.01
+      : y => y + LOG_H / 2 <= o.sill + 0.01 || y - LOG_H / 2 >= o.head - 0.01;
+    logRun(axis, fixed, o.u0, o.u1, layer0, keep, true, true, o.kind === 'window');
+    fitOpening(o);
+    openings.push(o);
+  }
+}
+
+// a run of stacked logs from a to b (only the courses `keep` allows). Ends that meet an
+// opening are cut square for its frame; ends at a corner run on past the other wall
+function logRun(axis, fixed, a, b, layer0, keep, cutA, cutB, footing) {
+  for (let k = 0; k < 6; k++) {
+    const y = layer0 + k * LOG_STEP;
+    if (!keep(y)) continue;
+    const u0 = cutA ? a : a - OVERHANG, u1 = cutB ? b : b + OVERHANG;
+    wallB.add([wallBlock(axis, fixed, u0, u1, y, LOG_H, LOG_D, LOG_TONES[(wrng() * 4) | 0], 0.19)], wrng); // deep chamfer: round-ish logs
+    if (k < 5 && keep(y + LOG_STEP)) wallB.add([wallBlock(axis, fixed, a, b, y + LOG_STEP / 2, 0.08, LOG_D * 0.72, CHINK, 0.02)], wrng);
+    for (const [cut, u] of [[cutA, u0], [cutB, u1]]) {
+      if (!cut) wallB.add([wallBlock(axis, fixed, u - 0.012, u + 0.012, y, LOG_H * 0.8, LOG_D * 0.8, END_GRAIN, 0.1)], wrng); // end grain
+    }
+  }
+  if (!footing) return;
+  if (axis === 'z') wallB.add([wallBlock(axis, fixed, a, b, 0.13, 0.24, LOG_D * 0.9, LOG_TONES[1], 0.06)], wrng); // sill log
+  for (let u = a - (cutA ? 0 : 0.3); u < b + (cutB ? 0 : 0.3);) { // fieldstone footing
+    const len = 0.45 + wrng() * 0.6;
+    wallB.add([wallBlock(axis, fixed, u, Math.min(u + len, b + (cutB ? 0 : 0.3)) - 0.04, 0.02, 0.18, LOG_D + 0.16, STONE_TONES[(wrng() * 3) | 0], 0.05)], wrng);
+    u += len;
+  }
+}
+
+// An opening's geometry and waypoints. Zombies come in via the OUTER waypoint, stand at
+// the FRONT to break it, then go through to the INNER one (or climb to the LANDING).
+// Its parts are modeled in a local frame: x along the wall, +z out of the cabin.
+function makeOpening(axis, fixed, u0, u1, kind) {
+  const c = (u0 + u1) / 2, s = Math.sign(fixed), ht = WALL_T / 2;
+  const p = out => axis === 'x' ? [c, fixed + s * out] : [fixed + s * out, c]; // world x, z at `out` from the wall
+  const [x, z] = p(0), [ox, oz] = p(OPENING_INSET), [ix, iz] = p(-OPENING_INSET), [fx, fz] = p(0.85), [lx, lz] = p(-0.95);
+  return {
+    kind, axis, u0, u1, w: u1 - u0, x, z, ox, oz, ix, iz, fx, fz, lx, lz,
+    sill: SILL[axis], head: HEAD[axis],
+    rotY: axis === 'x' ? (s > 0 ? 0 : Math.PI) : s * Math.PI / 2,
+    box: axis === 'x' ? { minX: u0, maxX: u1, minZ: fixed - ht, maxZ: fixed + ht } : { minX: fixed - ht, maxX: fixed + ht, minZ: u0, maxZ: u1 },
+    maxHp: kind === 'door' ? DOOR_HP : WINDOW_HP, hp: 0,
+    climber: null, // the zombie clambering through a broken window (one at a time)
+    jolt: 0, fallT: -1,
+  };
+}
+
+const glassMat = new THREE.MeshStandardMaterial({ color: 0x9fb6c9, roughness: 0.08, metalness: 0.4, transparent: true, opacity: 0.3, depthWrite: false });
+const glassCracked = new THREE.MeshStandardMaterial({ color: 0xd8e4ee, roughness: 0.45, metalness: 0.2, transparent: true, opacity: 0.55, depthWrite: false });
+// frame it in the baked walls, and build the parts that move or break
+function fitOpening(o) {
+  const place = at(o.x, o.z, o.rotY), hw = o.w / 2, frng = seeded(Math.round(o.x * 7 + o.z * 13) + 99);
+  const root = new THREE.Group();
+  root.position.set(o.x, 0, o.z); root.rotation.y = o.rotY;
+  world.add(root);
+  if (o.kind === 'door') {
+    wallB.add([
+      [JAMB, DOOR_TOP + 0.1, LOG_D + 0.1, -hw + JAMB / 2, (DOOR_TOP + 0.1) / 2, 0, POST, 0, 0, 0, 0.03],  // posts
+      [JAMB, DOOR_TOP + 0.1, LOG_D + 0.1, hw - JAMB / 2, (DOOR_TOP + 0.1) / 2, 0, POST, 0, 0, 0, 0.03],
+      [o.w + 0.1, 0.14, LOG_D + 0.12, 0, DOOR_TOP + 0.02, 0, POST, 0, 0, 0, 0.03],                     // header
+      [o.w - 0.1, 0.05, LOG_D, 0, 0.0, 0, POST, 0, 0, 0, 0.02],                                       // threshold
+    ], wrng, place);
+    // a ledged-and-braced plank door, hinged at its left edge, braces on the inside face
+    const lw = o.w - 2 * JAMB - 0.02, lh = 1.92, n = 4, pw = lw / n;
+    const blocks = [];
+    for (let i = 0; i < n; i++) blocks.push([pw - 0.012, lh, 0.06, pw * (i + 0.5), lh / 2, 0, i % 2 ? WEATHERED : 0x5f5646, 0, 0, 0, 0.012]);
+    blocks.push([lw - 0.04, 0.14, 0.04, lw / 2, 0.35, -0.05, POST, 0, 0, 0, 0.012], [lw - 0.04, 0.14, 0.04, lw / 2, lh - 0.35, -0.05, POST, 0, 0, 0, 0.012]);
+    const bl = Math.hypot(lw - 0.1, lh - 0.7);
+    blocks.push([0.12, bl, 0.04, lw / 2, lh / 2, -0.05, POST, 0, 0, -Math.atan2(lw - 0.1, lh - 0.7), 0.012]);
+    blocks.push([0.05, 0.05, 0.08, lw - 0.15, 1.0, 0.06, 0x2a2a2a, 0, 0, 0, 0.01]);                                     // handle
+    for (const y of [0.35, lh - 0.35]) blocks.push([0.32, 0.05, 0.015, 0.16, y, 0.035, 0x2a2a2a, 0, 0, 0, 0.005]);     // strap hinges
+    const leafMesh = new THREE.Mesh(bakeBlocks(blocks, frng), worldMat);
+    leafMesh.castShadow = true; leafMesh.receiveShadow = true;
+    o.fall = new THREE.Group(); o.fall.position.z = -0.02; root.add(o.fall);                   // pivot it falls in about
+    o.leaf = new THREE.Group(); o.leaf.position.set(-hw + JAMB + 0.01, 0.02, 0); o.fall.add(o.leaf); // hinge line
+    o.leaf.add(leafMesh);
+  } else {
+    const h = o.head - o.sill, mid = (o.sill + o.head) / 2, iw = o.w - 0.2;
+    wallB.add([
+      [0.1, h + 0.1, LOG_D + 0.06, -hw + 0.05, mid, 0, POST, 0, 0, 0, 0.02],              // jambs
+      [0.1, h + 0.1, LOG_D + 0.06, hw - 0.05, mid, 0, POST, 0, 0, 0, 0.02],
+      [o.w + 0.12, 0.08, LOG_D + 0.08, 0, o.head, 0, POST, 0, 0, 0, 0.02],              // head
+      [o.w + 0.3, 0.07, LOG_D + 0.24, 0, o.sill, 0.05, WEATHERED, 0, 0, 0, 0.02],        // sill board, lipped outside
+    ], wrng, place);
+    o.pane = new THREE.Group(); o.pane.position.y = mid; root.add(o.pane);
+    o.glass = new THREE.Mesh(new THREE.BoxGeometry(iw, h - 0.08, 0.02), glassMat);
+    const bars = new THREE.Mesh(bakeBlocks([[0.05, h - 0.08, 0.05, 0, 0, 0, POST], [iw, 0.05, 0.05, 0, 0, 0, POST]], frng), worldMat);
+    bars.castShadow = true;
+    o.bars = bars;
+    o.pane.add(o.glass, bars);
+    // what's left in the frame once it's smashed: jagged teeth round the edges
+    const teeth = [];
+    for (let i = 0; i < 9; i++) {
+      const side = i % 3, t = frng() - 0.5, len = 0.12 + frng() * 0.2;
+      const [px, py] = side === 0 ? [t * iw, -(h - 0.1) / 2 + 0.05] : side === 1 ? [-iw / 2 + 0.05, t * (h - 0.1)] : [iw / 2 - 0.05, t * (h - 0.1)];
+      teeth.push([0.03 + frng() * 0.06, len, 0.015, px, py, 0, 0xffffff, 0, 0, (frng() - 0.5) * 1.6, 0]);
+    }
+    for (let i = 0; i < 3; i++) teeth.push([0.04 + frng() * 0.05, 0.1 + frng() * 0.12, 0.015, (frng() - 0.5) * iw, (h - 0.1) / 2 - 0.04, 0, 0xffffff, 0, 0, Math.PI + (frng() - 0.5) * 1.2, 0]);
+    o.shards = new THREE.Mesh(bakeBlocks(teeth, frng, true), glassMat);
+    o.pane.add(o.shards);
+  }
+}
+
+// south wall (+Z, nearest the camera): the back door
+buildWall('x',  HALF, [[-0.8, 0.8, 'door']]);
+// north wall (-Z): the front door on the left, a window on the right
+buildWall('x', -HALF, [[-5.8, -4.2, 'door'], [4, 6, 'window']]);
+// west and east walls: a window each
+buildWall('z', -HALF, [[-1.5, 0.5, 'window']]);
+buildWall('z',  HALF, [[1.5, 3.5, 'window']]);
+
+// --- inside, on the walls the camera looks at: a pantry shelf, a trophy, a calendar, a coat ---
+const IN_N = -HALF + LOG_D / 2, IN_W = -HALF + LOG_D / 2, IN_E = HALF - LOG_D / 2;
+wallB.add([
+  [1.9, 0.06, 0.3, -1.7, 1.6, IN_N + 0.15, 0x5e4730, 0, 0, 0, 0.015],          // shelf
+  [0.05, 0.22, 0.26, -2.5, 1.48, IN_N + 0.13, POST], [0.05, 0.22, 0.26, -0.9, 1.48, IN_N + 0.13, POST],
+  [0.14, 0.2, 0.14, -2.45, 1.73, IN_N + 0.15, 0x6e7f4a, 0, 0, 0, 0.03],         // jars and cans
+  [0.14, 0.22, 0.14, -2.22, 1.74, IN_N + 0.15, 0xa05a2a, 0, 0, 0, 0.03],
+  [0.12, 0.16, 0.12, -1.95, 1.71, IN_N + 0.15, 0x8a8f96, 0, 0, 0, 0.02],
+  [0.12, 0.16, 0.12, -1.78, 1.71, IN_N + 0.13, 0x8a8f96, 0, 0, 0, 0.02],
+  [0.32, 0.08, 0.22, -1.25, 1.67, IN_N + 0.14, 0x5a2a20, 0, 0.1, 0, 0.015],     // stacked books
+  [0.3, 0.07, 0.2, -1.24, 1.745, IN_N + 0.14, 0x2a3a4a, 0, -0.15, 0, 0.015],
+  [0.36, 0.44, 0.05, 1.4, 1.9, IN_N + 0.025, POST, 0, 0, 0, 0.02],             // trophy plaque
+  [0.17, 0.2, 0.16, 1.4, 1.9, IN_N + 0.1, 0xcfc4a2, 0, 0, 0, 0.03],            // deer skull
+  [0.04, 0.42, 0.04, 1.27, 2.13, IN_N + 0.1, 0xb8ab88, 0, 0, 0.55, 0.01],       // antlers
+  [0.04, 0.42, 0.04, 1.53, 2.13, IN_N + 0.1, 0xb8ab88, 0, 0, -0.55, 0.01],
+  [0.03, 0.18, 0.03, 1.15, 2.25, IN_N + 0.1, 0xb8ab88, 0, 0, -0.3, 0.008],
+  [0.03, 0.18, 0.03, 1.65, 2.25, IN_N + 0.1, 0xb8ab88, 0, 0, 0.3, 0.008],
+  [0.48, 0.62, 0.02, 2.75, 1.4, IN_N + 0.012, 0xb8a888, 0, 0, 0.04, 0.005],     // calendar
+  [0.4, 0.2, 0.025, 2.75, 1.58, IN_N + 0.015, 0x7a2a22, 0, 0, 0.04, 0.005],
+  [0.06, 0.06, 1.1, IN_W + 0.04, 1.75, 4.6, POST, 0, 0, 0, 0.015],             // coat hooks
+  [0.16, 0.85, 0.5, IN_W + 0.1, 1.3, 4.3, 0x3e4a33, 0, 0, 0.04, 0.04],          // a coat
+  [0.24, 0.12, 0.24, IN_W + 0.14, 1.76, 4.95, 0x6b5232, 0, 0, 0, 0.04],         // hat
+  [0.03, 0.5, 0.42, IN_E - 0.015, 1.6, -5, POST, 0, 0, 0, 0.01],               // mirror
+  [0.035, 0.42, 0.34, IN_E - 0.02, 1.6, -5, 0x55606a, 0, 0, 0, 0.005],
+], wrng);
+bakedMesh(floorB, false);
+bakedMesh(wallB);
+
+// --- the yard: woodpile, chopping block, a dead pickup, a porch lantern, a broken fence ---
+const yard = new BlockBatch(), yrng = seeded(41);
+const CLEARINGS = []; // props trees and brush keep out of: [x, z, radius]
+for (let k = 0; k < 4; k++) for (let i = 0; i < 10; i++) {                     // split firewood
+  const x = 3.75 + i * 0.37 + (k % 2) * 0.18, y = 0.17 + k * 0.3;
+  if (x > 7.5) continue;
+  yard.add([[0.33, 0.3, 0.62, x, y, 10.9, LOG_TONES[(yrng() * 4) | 0], 0, 0, (yrng() - 0.5) * 0.2, 0.1],
+            [0.27, 0.24, 0.02, x, y, 11.22, END_GRAIN, 0, 0, 0, 0.06]], yrng);
+}
+yard.add([[0.12, 1.4, 0.12, 3.45, 0.7, 10.9, POST], [0.12, 1.4, 0.12, 7.75, 0.7, 10.9, POST]], yrng);
+CLEARINGS.push([5.6, 11, 2.4]);
+yard.add([
+  [0.62, 0.5, 0.62, 0, 0.25, 0, LOG_TONES[2], 0, 0, 0, 0.18],                  // chopping block
+  [0.5, 0.02, 0.5, 0, 0.505, 0, END_GRAIN, 0, 0, 0, 0.12],
+  [0.06, 0.06, 0.78, 0.06, 0.82, -0.2, 0x6b4a2a, -0.75, 0, 0, 0.02],            // axe handle
+  [0.06, 0.2, 0.28, 0.06, 0.56, 0.06, 0x5a5e66, -0.75, 0, 0, 0.02],             // axe head, bitten in
+], yrng, at(-4.3, 12.5, 0.6));
+CLEARINGS.push([-4.3, 12.5, 1.5]);
+// rusted pickup, one tire flat, one headlight out
+const RUST = 0x46524c, RUST2 = 0x6a4a2c, CHROME = 0x7a7a72, GLASS = 0x182027;
+yard.add([
+  [1.92, 0.62, 4.6, 0, 0.78, 0, RUST, 0, 0, 0, 0.12],                          // body
+  [1.8, 0.74, 1.5, 0, 1.45, 0.45, RUST, 0, 0, 0, 0.1],                          // cab
+  [1.6, 0.4, 0.05, 0, 1.52, 1.21, GLASS, -0.25, 0, 0, 0.01],                    // windshield
+  [1.82, 0.36, 1.2, 0, 1.55, 0.4, GLASS, 0, 0, 0, 0.02],                        // side windows
+  [1.86, 0.2, 1.4, 0, 1.18, 1.55, RUST, 0, 0, 0, 0.08],                         // hood
+  [0.1, 0.42, 2.0, 0.92, 1.28, -1.2, RUST, 0, 0, 0, 0.03], [0.1, 0.42, 2.0, -0.92, 1.28, -1.2, RUST, 0, 0, 0, 0.03],
+  [1.94, 0.42, 0.1, 0, 1.28, -2.25, RUST, 0, 0, 0.06, 0.03],                    // tailgate, sprung
+  [1.7, 0.06, 1.9, 0, 1.1, -1.2, 0x2a2a28, 0, 0, 0, 0.01],                      // bed floor
+  [2.02, 0.2, 0.16, 0, 0.6, 2.33, CHROME, 0, 0, 0, 0.05], [2.02, 0.2, 0.16, 0, 0.6, -2.33, CHROME, 0, 0, 0, 0.05],
+  [0.32, 0.2, 0.05, 0.62, 0.95, 2.31, 0xe8e2b0, 0, 0, 0, 0.02], [0.32, 0.2, 0.05, -0.62, 0.95, 2.31, 0x1a1a18, 0, 0, 0, 0.02],
+  [0.6, 0.34, 0.03, 0.97, 0.85, 0.9, RUST2, 0, 0, 0, 0.01], [0.5, 0.3, 0.03, -0.97, 0.75, -1.6, RUST2, 0, 0, 0, 0.01],
+  [0.9, 0.04, 0.7, 0.2, 1.33, -1.5, 0x4a3a2a, 0, 0.3, 0, 0.01],                 // tarp in the bed
+  [0.36, 0.7, 0.7, 0.98, 0.35, 1.45, 0x141414, 0, 0, 0, 0.2], [0.36, 0.7, 0.7, -0.98, 0.35, 1.45, 0x141414, 0, 0, 0, 0.2],
+  [0.36, 0.7, 0.7, 0.98, 0.35, -1.45, 0x141414, 0, 0, 0, 0.2], [0.36, 0.56, 0.78, -0.98, 0.26, -1.45, 0x141414, 0, 0, 0, 0.16],
+], yrng, at(-7.6, 15.2, 0.55));
+CLEARINGS.push([-7.6, 15.2, 3.4]);
+// props zombies have to walk around: oriented boxes, half extents in the prop's own frame
+const SOLIDS = [];
+function addSolid(x, z, ry, hx, hz) { SOLIDS.push({ x, z, hx, hz, c: Math.cos(ry), s: Math.sin(ry) }); }
+addSolid(-7.6, 15.2, 0.55, 1.05, 2.45); // the pickup, bumper to bumper
+CLEARINGS.push([2, 23.5, 4.5], [1, 17.5, 3.5], [7.5, 20, 3.5]); // the title screen's camera and its view of the door
+// porch lantern on a post by the door
+yard.add([[0.16, 2.3, 0.16, 2.7, 1.15, 11.3, POST], [0.56, 0.08, 0.08, 2.48, 2.22, 11.3, POST], [0.24, 0.06, 0.24, 2.26, 2.0, 11.3, 0x2a2a2a]], yrng);
+// a fence that gave up
+for (const [x0, z0, x1, z1, broken] of [[8.6, 12.6, 10.8, 12.0, 0], [10.8, 12.0, 12.6, 10.6, 1], [-12.5, -9.5, -12.2, -12, 0]]) {
+  const len = Math.hypot(x1 - x0, z1 - z0), ry = Math.atan2(x1 - x0, z1 - z0);
+  yard.add([[0.14, 1.2, 0.14, 0, 0.6, 0, POST]], yrng, at(x0, z0, ry));
+  yard.add([[0.14, 1.2, 0.14, 0, 0.6, 0, POST]], yrng, at(x1, z1, ry));
+  yard.add(broken
+    ? [[0.08, 0.14, len, 0, 0.5, len / 2, WEATHERED, 0.35, 0, 0, 0.02]]          // rail down at one end
+    : [[0.08, 0.14, len, 0, 0.95, len / 2, WEATHERED, 0, 0, 0, 0.02], [0.08, 0.14, len, 0, 0.5, len / 2, WEATHERED, 0, 0, 0, 0.02]], yrng, at(x0, z0, ry));
+}
+// stumps and a fallen trunk at the treeline
+for (const [x, z, s] of [[11.6, -4, 1], [-11.4, 7.5, 0.8], [6, -12, 1.1], [-12.6, -2.5, 0.9], [12.8, 7.5, 0.85], [-2.5, -12.4, 1]]) {
+  yard.add([[0.55 * s, 0.4 * s, 0.55 * s, 0, 0.2 * s, 0, 0x3a2b1d, 0, yrng(), 0, 0.15], [0.46 * s, 0.02, 0.46 * s, 0, 0.4 * s + 0.01, 0, END_GRAIN, 0, yrng(), 0, 0.12]], yrng, at(x, z));
+}
+yard.add([[0.6, 0.55, 5.5, 0, 0.27, 0, 0x3a2f24, 0, 0, 0, 0.18], [0.5, 0.45, 0.02, 0, 0.27, 2.76, END_GRAIN, 0, 0, 0, 0.12],
+          [0.14, 0.9, 0.14, 0.3, 0.6, -1.2, 0x3a2f24, 0, 0, -0.7, 0.03]], yrng, at(-13.5, 4, 0.3));
+CLEARINGS.push([-13.5, 4, 3]);
+bakedMesh(yard);
+
+const lanternGlass = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.26, 0.2),
+  new THREE.MeshStandardMaterial({ color: 0x2a1a08, emissive: 0xffb050, emissiveIntensity: 1.6 }));
+lanternGlass.position.set(2.26, 1.84, 11.3);
+world.add(lanternGlass);
+const lanternLight = new THREE.PointLight(0xffa64a, 7, 9, 2);
+lanternLight.position.set(2.26, 1.7, 11.3);
+world.add(lanternLight);
+// a guttering flame: two slow wobbles and the odd dip, worse in the wind
+function updateWorld(dt) {
+  const t = performance.now() / 1000;
+  const f = 0.85 + 0.08 * Math.sin(t * 7.3) + 0.06 * Math.sin(t * 13.1 + 1) - (Math.sin(t * 0.9) > 0.97 ? 0.35 : 0);
+    - weather.level * 0.2 * (0.5 + 0.5 * Math.sin(t * 5.3) * Math.sin(t * 2.1)); // and gutters in the storm
+  lanternLight.intensity = 7 * f;
+  lanternGlass.material.emissiveIntensity = 1.6 * f;
+}
+
+// --- forest: instanced pines, spruces, oaks and dead snags, plus brush on the floor ---
+// Filled from just outside the walls out to well beyond the fog far plane,
+// so the tree line never visibly ends — it just fades into black.
+const FOREST_COUNT = 900;
+const R_MIN = 13, R_MAX = 70; // R_MAX is far past fog.far (62) so no visible edge
+const SHADOW_R = 24;          // trees nearer than this cast shadows (the rest are lost in the dark)
+const TRUNK = 0x2b2018, NEEDLES = 0x1a2b1a, NEEDLE_TIPS = 0x2a4229;
+function pineTree(rng, tiers, w0, tierH, trunkH) {
+  const b = [[0.32, trunkH, 0.32, 0, trunkH / 2, 0, TRUNK, 0, 0, 0, 0.06]];
+  let y = trunkH * 0.6;
+  for (let i = 0; i < tiers; i++) {
+    const w = w0 * (1 - (i / tiers) * 0.75), ry = (i % 2) * Math.PI / 4; // each tier turned 45°: a star from above
+    b.push([w, tierH * 0.62, w, 0, y, 0, NEEDLES, 0, ry, 0, 0.14],
+           [w * 0.6, tierH * 0.42, w * 0.6, 0, y + tierH * 0.36, 0, NEEDLE_TIPS, 0, ry, 0, 0.09]); // moonlit top of the bough
+    y += tierH * 0.78;
+  }
+  b.push([0.3, tierH * 0.7, 0.3, 0, y, 0, NEEDLE_TIPS, 0, 0, 0, 0.08]);
+  return b;
+}
+function oakTree(rng) {
+  const b = [[0.46, 2.4, 0.46, 0, 1.2, 0, TRUNK, 0, 0, 0, 0.08]];
+  for (let i = 0; i < 6; i++) {
+    const s = 1.3 + rng() * 0.9, a = i * 1.05;
+    b.push([s, s * 0.85, s, Math.cos(a) * 0.75 * (i ? 1 : 0), 2.6 + rng() * 1.1 + (i ? 0 : 0.8), Math.sin(a) * 0.75 * (i ? 1 : 0), i % 2 ? 0x24311c : 0x2e3d22, 0, rng(), 0, 0.2]);
+  }
+  return b;
+}
+function deadTree(rng) {
+  const b = [[0.34, 4.4, 0.34, 0, 2.2, 0, 0x3d362e, 0, 0, 0, 0.06]];
+  for (let i = 0; i < 6; i++) {
+    const len = 0.9 + rng() * 0.8, y0 = 1.8 + i * 0.42, phi = 0.7 + rng() * 0.4, side = i % 2 ? 1 : -1;
+    b.push(i % 3 === 2
+      ? [0.11, len, 0.11, 0, y0 + Math.cos(phi) * len / 2, side * Math.sin(phi) * len / 2, 0x3d362e, side * phi, 0, 0, 0.03]
+      : [0.11, len, 0.11, -side * Math.sin(phi) * len / 2, y0 + Math.cos(phi) * len / 2, 0, 0x3d362e, 0, 0, side * phi, 0.03]);
+  }
+  return b;
+}
+const trng = seeded(77);
+// near trees are bevelled and cast shadows; far ones (lost in the fog) are flat boxes
+const treeKind = (blocks, weight) => ({ geo: bakeBlocks(blocks, seeded(1)), far: bakeBlocks(blocks, seeded(1), true), weight });
+const TREE_KINDS = [
+  treeKind(pineTree(trng, 4, 3.0, 1.05, 1.6), 38),  // pine
+  treeKind(pineTree(trng, 3, 2.6, 0.95, 1.2), 18),  // young pine
+  treeKind(pineTree(trng, 6, 1.8, 0.75, 1.3), 22),  // spruce
+  treeKind(oakTree(trng), 13),
+  treeKind(deadTree(trng), 9),
+];
+const inClearing = (x, z, pad = 0) => (Math.abs(x) < EDGE + 0.6 + pad && Math.abs(z) < EDGE + 0.6 + pad)
+  || CLEARINGS.some(([cx, cz, r]) => (x - cx) ** 2 + (z - cz) ** 2 < (r + pad) ** 2);
+// scatter instances of each kind across the forest; near ones (within SHADOW_R) cast shadows
+function scatter(kinds, count, rMin, rMax, pad, scale, tint) {
+  // near instances go in four quadrant meshes, so the camera and each face of the muzzle
+  // light's shadow can cull the ones it can't see; everything far is one mesh
+  const lists = kinds.map(() => [[], [], [], [], []]);
+  const total = kinds.reduce((s, k) => s + k.weight, 0);
+  const _o = new THREE.Object3D(), _col = new THREE.Color();
+  for (let i = 0; i < count; i++) {
+    // sqrt() keeps density roughly uniform across the annulus area
+    const rad = Math.sqrt(rMin * rMin + Math.random() * (rMax * rMax - rMin * rMin));
+    const ang = Math.random() * Math.PI * 2;
+    const x = Math.cos(ang) * rad, z = Math.sin(ang) * rad;
+    if (inClearing(x, z, pad)) continue;
+    let r = Math.random() * total, k = 0;
+    while ((r -= kinds[k].weight) > 0) k++;
+    const s = scale[0] + Math.random() * (scale[1] - scale[0]);
+    _o.position.set(x, GROUND_Y, z);
+    _o.rotation.set(0, Math.random() * Math.PI * 2, 0);
+    _o.scale.set(s, s * (0.9 + Math.random() * 0.3), s);
+    _o.updateMatrix();
+    lists[k][rad < SHADOW_R ? (x > 0 ? 1 : 0) + (z > 0 ? 2 : 0) : 4].push([_o.matrix.clone(), _col.setScalar(tint[0] + Math.random() * (tint[1] - tint[0])).clone()]);
+  }
+  kinds.forEach((kind, k) => lists[k].forEach((items, slot) => {
+    if (!items.length) return;
+    const far = slot === 4;
+    const m = new THREE.InstancedMesh(far && kind.far ? kind.far : kind.geo, worldMat, items.length);
+    items.forEach(([mat, col], i) => { m.setMatrixAt(i, mat); m.setColorAt(i, col); });
+    m.computeBoundingSphere();
+    m.castShadow = kind.shadow !== false && !far;
+    m.receiveShadow = true;
+    world.add(m);
+  }));
+}
+scatter(TREE_KINDS, FOREST_COUNT, R_MIN, R_MAX, 0.8, [0.85, 1.3], [0.8, 1.1]);
+
+// brush: grass tufts, ferns and rocks between the walls and the trees
+const brng = seeded(91);
+const tuft = [];
+for (let i = 0; i < 6; i++) {
+  const a = i * 1.05 + brng(), h = 0.25 + brng() * 0.25;
+  tuft.push([0.05, h, 0.05, Math.cos(a) * 0.07, h / 2, Math.sin(a) * 0.07, brng() < 0.5 ? 0x2d3b1e : 0x3a4826, Math.sin(a) * 0.35, 0, -Math.cos(a) * 0.35, 0]);
+}
+const fern = [];
+for (let i = 0; i < 7; i++) {
+  const a = i * 0.9;
+  fern.push([0.11, 0.03, 0.6, Math.sin(a) * 0.28, 0.12, Math.cos(a) * 0.28, 0x2c4a22, -0.35, a, 0, 0]);
+}
+const rock = [[0.5, 0.32, 0.42, 0, 0.12, 0, 0x3a3834, 0, 0.3, 0.1, 0.1], [0.3, 0.22, 0.3, 0.24, 0.08, 0.14, 0x33312d, 0, 0.9, 0, 0.08]];
+const BRUSH = [
+  { geo: bakeBlocks(tuft, brng), weight: 60, shadow: false },
+  { geo: bakeBlocks(fern, brng), weight: 25, shadow: false },
+  { geo: bakeBlocks(rock, brng), weight: 15 },
+];
+scatter(BRUSH, 1000, 10.6, 28, 0, [0.7, 1.4], [0.75, 1.15]); // out to where the dark swallows it
+
+// --- lights ---
+const ambient = new THREE.AmbientLight(0x4a5b80, 3.0);
+scene.add(ambient);
+const moon = new THREE.DirectionalLight(0xc4d4f2, 2.8);
+moon.position.set(-18, 34, -10);
+moon.castShadow = true;
+moon.shadow.mapSize.set(1024, 1024);
+moon.shadow.camera.left = -28; moon.shadow.camera.right = 28;
+moon.shadow.camera.top = 28; moon.shadow.camera.bottom = -28;
+moon.shadow.camera.near = 1; moon.shadow.camera.far = 80;
+scene.add(moon);
+
+// --- night sky: only the low title shot ever sees it (the gameplay camera looks down
+// too steeply). A faint glow at the horizon cuts the treeline out in silhouette ---
+const sky = new THREE.Mesh(new THREE.SphereGeometry(150, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  vertexShader: 'varying vec3 vDir; void main() { vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `varying vec3 vDir;
+    void main() {
+      float h = clamp(vDir.y, 0.0, 1.0);
+      vec3 c = mix(vec3(0.075, 0.095, 0.15), vec3(0.02, 0.024, 0.04), pow(h, 0.45));
+      c = mix(c, vec3(0.02, 0.024, 0.04), smoothstep(0.0, -0.04, vDir.y)); // below the horizon: the fog's dark
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+}));
+sky.renderOrder = -1;
+scene.add(sky);
+function moonTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const halo = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  halo.addColorStop(0, 'rgba(200,214,240,.55)');
+  halo.addColorStop(0.2, 'rgba(160,180,220,.16)');
+  halo.addColorStop(1, 'rgba(160,180,220,0)');
+  g.fillStyle = halo; g.fillRect(0, 0, 256, 256);
+  g.fillStyle = '#e4e9f2';
+  g.beginPath(); g.arc(128, 128, 22, 0, Math.PI * 2); g.fill();
+  g.fillStyle = 'rgba(150,160,180,.35)'; // a few maria
+  for (const [x, y, r] of [[121, 122, 7], [134, 131, 5], [126, 137, 4]]) { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const moonDisc = new THREE.Sprite(new THREE.SpriteMaterial({ map: moonTexture(), transparent: true, depthWrite: false, fog: false }));
+moonDisc.position.set(-26, 27, -116); // rides on the sky dome, low over the trees behind the cabin
+moonDisc.scale.setScalar(30);
+sky.add(moonDisc);
+
+// ===================================================================
+// WEATHER — the night turns as the waves climb: drizzle from wave 5, steady rain by
+// 8, a downpour with lightning and thunder by 12, and a howling storm by 15. One
+// storm level (0..1) drives all of it: how much rain falls, how fast and how slanted,
+// splashes on the ground, wet surfaces, dimmer moonlight, closer fog, how hard the wind
+// blows in the mix, and how often lightning strikes. (The rain itself makes no sound.)
+// ===================================================================
+const STORM_STEPS = [[4, 0], [5, 0.15], [8, 0.4], [12, 0.7], [15, 1]]; // [wave, storm level]
+const BOLT_LEVEL = 0.7; // lightning from here (wave 12), striking more and more often up to the full storm
+function stormFor(wave) {
+  for (let i = 1; i < STORM_STEPS.length; i++) {
+    const [w0, s0] = STORM_STEPS[i - 1], [w1, s1] = STORM_STEPS[i];
+    if (wave <= w1) return wave <= w0 ? s0 : s0 + (s1 - s0) * (wave - w0) / (w1 - w0);
+  }
+  return 1;
+}
+const NIGHT = new THREE.Color(0x05060a), BOLT_SKY = new THREE.Color(0x3a4458);
+const weather = {
+  level: 0, target: 0, t: 0, drop: 0, gust: 1,
+  flashT: -1, flash: 0, nextBolt: 8, thunderIn: -1, thunderNear: 0, splashI: 0, splashDue: 0, soundT: 0,
+  set(level) { this.level = this.target = level; this.flashT = -1; this.thunderIn = -1; this.nextBolt = 8; },
+};
+
+// rain: streaks falling through a box that follows the survivor, placed by the GPU
+const RAIN_MAX = 7000, RAIN_AREA = 72, RAIN_TOP = 16;
+const rainGeo = new THREE.BufferGeometry();
+{
+  const seed = new Float32Array(RAIN_MAX * 6), tip = new Float32Array(RAIN_MAX * 2);
+  for (let i = 0; i < RAIN_MAX; i++) {
+    const a = Math.random(), b = Math.random(), c = Math.random();
+    seed.set([a, b, c, a, b, c], i * 6); tip[i * 2 + 1] = 1; // two ends of one streak
+  }
+  rainGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(RAIN_MAX * 6), 3)); // placeholder: the shader positions them
+  rainGeo.setAttribute('seed', new THREE.BufferAttribute(seed, 3));
+  rainGeo.setAttribute('tip', new THREE.BufferAttribute(tip, 1));
+}
+const rain = new THREE.LineSegments(rainGeo, new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false,
+  uniforms: { drop: { value: 0 }, center: { value: new THREE.Vector3() }, speed: { value: 12 }, len: { value: 0.4 }, wind: { value: new THREE.Vector2() }, opacity: { value: 0 } },
+  vertexShader: `
+    attribute vec3 seed; attribute float tip;
+    uniform float drop, speed, len; uniform vec3 center; uniform vec2 wind;
+    varying float vTip;
+    const float TOP = ${RAIN_TOP.toFixed(1)}, AREA = ${RAIN_AREA.toFixed(1)};
+    void main() {
+      float y = mod(seed.z * TOP - drop * (0.85 + 0.3 * seed.x), TOP); // height above the ground
+      vec3 p = vec3(center.x + (seed.x - 0.5) * AREA, y, center.z + (seed.y - 0.5) * AREA);
+      p.xz += wind * (TOP - y) / speed;                         // blown along as it falls
+      p += normalize(vec3(-wind.x, speed, -wind.y)) * len * tip; // the streak trails up-wind
+      vTip = tip;
+      gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+    }`,
+  fragmentShader: `
+    uniform float opacity; varying float vTip;
+    void main() { gl_FragColor = vec4(0.8, 0.87, 0.95, opacity * (1.0 - vTip * 0.8)); }`,
+}));
+rain.frustumCulled = false;
+rain.visible = false;
+scene.add(rain);
+// splashes: little rings that flick out where drops land
+const SPLASHES = 320;
+const splash = new THREE.InstancedMesh(new THREE.RingGeometry(0.02, 0.05, 10).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xbfd0e0, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }), SPLASHES);
+const splashAt = Array.from({ length: SPLASHES }, () => ({ x: 0, z: 0, born: -9 }));
+splash.frustumCulled = false;
+splash.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(splash);
+const _sm = new THREE.Matrix4(), _sc = new THREE.Color();
+
+function strikeLightning() {
+  weather.flashT = 0;
+  weather.thunderNear = Math.random();
+  weather.thunderIn = 0.15 + (1 - weather.thunderNear) * 2.2; // the farther the strike, the longer the wait
+}
+
+function updateWeather(dt) {
+  const w = weather, L = (w.level += Math.max(-dt * 0.08, Math.min(dt * 0.08, w.target - w.level)));
+  w.t += dt;
+  // gusts come and go, harder as it builds
+  w.gust = 1 + L * (0.45 * Math.sin(w.t * 0.63) + 0.3 * Math.sin(w.t * 1.71 + 2) + 0.15 * Math.sin(w.t * 4.1));
+  // --- rain ---
+  const u = rain.material.uniforms, speed = 11 + 13 * L;
+  rain.visible = L > 0.005;
+  rain.geometry.setDrawRange(0, Math.round(RAIN_MAX * L) * 2);
+  u.speed.value = speed;
+  u.len.value = 0.25 + 1.0 * L;
+  u.opacity.value = 0.3 + 0.35 * L;
+  u.wind.value.set(7 * L * L * w.gust, 2.5 * L * L * w.gust); // out of the west, a touch north
+  u.drop.value = (w.drop += speed * dt);
+  u.center.value.set(player.position.x, 0, player.position.z - 4);
+  // --- splashes, spread over what the camera can see ---
+  w.splashDue += L * 520 * dt;
+  for (; w.splashDue >= 1; w.splashDue--) {
+    const s = splashAt[w.splashI = (w.splashI + 1) % SPLASHES];
+    s.x = player.position.x + rnd(-26, 26); s.z = player.position.z + rnd(-22, 14); s.born = w.t;
+  }
+  for (let i = 0; i < SPLASHES; i++) {
+    const s = splashAt[i], k = (w.t - s.born) / 0.22;
+    const live = k >= 0 && k < 1 && L > 0.005;
+    _sm.makeScale(live ? 1 + 2.5 * k : 0, 1, live ? 1 + 2.5 * k : 0).setPosition(s.x, 0.03, s.z);
+    splash.setMatrixAt(i, _sm);
+    splash.setColorAt(i, _sc.setScalar(live ? (1 - k) * (1 - k) * (0.35 + 0.5 * L) : 0));
+  }
+  splash.instanceMatrix.needsUpdate = true;
+  splash.instanceColor.needsUpdate = true;
+  // --- lightning: from wave 12, more and more often ---
+  if (L >= BOLT_LEVEL - 0.001 && state.running) {
+    if ((w.nextBolt -= dt) <= 0) {
+      strikeLightning();
+      w.nextBolt = THREE.MathUtils.lerp(16, 3.5, (L - BOLT_LEVEL) / (1 - BOLT_LEVEL)) * rnd(0.6, 1.4);
+    }
+  }
+  if (w.thunderIn >= 0 && (w.thunderIn -= dt) < 0) audio.thunder(w.thunderNear);
+  // the flash: a bright stroke, a dip, a second stroke, then it dies away
+  if (w.flashT >= 0) {
+    const t = (w.flashT += dt);
+    w.flash = Math.exp(-t * 14) + (t > 0.13 ? 0.8 * Math.exp(-(t - 0.13) * 9) : 0);
+    if (t > 1.2) { w.flashT = -1; w.flash = 0; }
+  }
+  // --- the world gets wet, dark and close ---
+  scene.fog.near = 32 - 14 * L;
+  scene.fog.far = 62 - 18 * L;
+  scene.fog.color.copy(NIGHT).lerp(BOLT_SKY, w.flash * 0.7);
+  scene.background.copy(scene.fog.color);
+  moon.intensity = 2.8 - 1.1 * L + w.flash * 14;
+  ambient.intensity = 3.0 - 0.7 * L + w.flash * 3;
+  worldMat.roughness = 0.92 - 0.35 * L;
+  ground.material.roughness = 1 - 0.4 * L;
+  // and the wind in the mix (a few times a second is plenty)
+  if ((w.soundT -= dt) <= 0) { w.soundT = 0.2; audio.weather(L, w.gust); }
+}
+
+// ===================================================================
+// PLAYER — a blocky survivor rig. Arms and legs are two-bone IK chains:
+// both hands stay locked onto the rifle (so recoil and the reload carry
+// the arms with them) and the feet follow a procedural run cycle that
+// plants each boot while it's on the ground.
+// ===================================================================
+const player = new THREE.Group();
+
+// one rig block, sized in world units
+function blk(mat, w, h, d, x, y, z, parent, r) {
+  const m = new THREE.Mesh(bevelBox(w, h, d, r), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  parent.add(m);
+  return m;
+}
+
+// red-and-black buffalo check flannel, 8x8 texels a repeat: crisp pixels up
+// close, and the mipmaps blend it to a dark red at gameplay distance
+function plaidTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 8;
+  const g = c.getContext('2d');
+  for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+    const warp = i < 4, weft = j < 4;
+    g.fillStyle = warp && weft ? '#191314' : warp || weft ? '#5c1b18' : '#a8332b';
+    g.fillRect(i, j, 1, 1);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.NearestFilter;
+  t.anisotropy = 4;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// materials — a hunter's kit: flannel, olive chest rig, blaze-orange beanie
+// (the beanie and pack are what read from the top-down camera)
+const mat = (color, o) => new THREE.MeshStandardMaterial({ color, roughness: 0.9, ...o });
+const M = {
+  flannel: mat(0xffffff, { map: plaidTexture() }),
+  lining:  mat(0xa88d68, { roughness: 1 }),   // sherpa collar
+  vest:    mat(0x515737),
+  vestDk:  mat(0x3a3e27),
+  pants:   mat(0x39404d),
+  leather: mat(0x5e3f27, { roughness: 0.7 }),
+  sole:    mat(0x17130f),
+  skin:    mat(0xe0915c),
+  hair:    mat(0x3a2517, { roughness: 1 }),
+  beard:   mat(0x5b3920, { roughness: 1 }),
+  beanie:  mat(0xe0662a, { roughness: 1 }),
+  cuff:    mat(0xb9501f, { roughness: 1 }),
+  eye:     mat(0x16100d, { roughness: 0.4 }),
+  canvas:  mat(0x6f5d3f),                     // pack + rolled cuffs
+  bedroll: mat(0x3e4a36),
+  brass:   mat(0xc9a14a, { roughness: 0.35, metalness: 0.7 }),
+  metal:   mat(0x2b2e34, { roughness: 0.42, metalness: 0.45 }),
+  wood:    mat(0x7b4a29, { roughness: 0.65 }),
+  rubber:  mat(0x151518),
+  lens:    mat(0x10161e, { roughness: 0.15, emissive: 0x2a6fb8, emissiveIntensity: 0.2 }),
+};
+
+// rig proportions (world units; the survivor stands ~2.6 tall)
+const THIGH = 0.44, SHIN = 0.42, ANKLE_H = 0.15, HIP_H = 0.97;
+const UPPER_ARM = 0.42, FOREARM = 0.42;
+
+// --- lower body: `lower` turns with the legs, `pelvis` bobs/rolls/twists with the stride ---
+const lower = new THREE.Group(); player.add(lower);
+const pelvis = new THREE.Group(); lower.add(pelvis);
+blk(M.pants, 0.62, 0.3, 0.4, 0, 0.02, 0, pelvis);              // hips
+blk(M.leather, 0.66, 0.08, 0.43, 0, 0.12, 0, pelvis, 0.02);    // belt
+blk(M.brass, 0.1, 0.07, 0.03, 0, 0.12, 0.22, pelvis, 0.01);    // buckle
+blk(M.vestDk, 0.12, 0.17, 0.17, 0.36, 0.02, 0.04, pelvis);     // hip pouch (left)
+blk(M.leather, 0.07, 0.28, 0.1, -0.35, -0.04, -0.03, pelvis);  // knife sheath (right)
+
+// +X is the survivor's left (they face +Z)
+const legs = [1, -1].map((side, i) => {
+  const thigh = blk(M.pants, 0.26, THIGH + 0.08, 0.29, 0, 0, 0, lower);
+  const shin = blk(M.pants, 0.24, SHIN + 0.06, 0.27, 0, 0, 0, lower);
+  blk(M.vestDk, 0.2, 0.17, 0.07, 0, SHIN / 2 - 0.03, 0.15, shin);  // knee pad
+  const boot = new THREE.Group(); lower.add(boot);                  // origin at the ankle
+  blk(M.leather, 0.27, 0.17, 0.29, 0, 0, -0.01, boot);              // shaft
+  blk(M.leather, 0.27, 0.1, 0.42, 0, -0.08, 0.06, boot);            // foot
+  blk(M.sole, 0.29, 0.05, 0.45, 0, -0.13, 0.06, boot, 0.015);       // sole
+  return {
+    side, thigh, shin, boot, phase: i * 0.5, prev: 0,
+    hip: new THREE.Vector3(side * 0.16, 0, 0),
+    hipP: new THREE.Vector3(), foot: new THREE.Vector3(), knee: new THREE.Vector3(), ankle: new THREE.Vector3(),
+  };
+});
+
+// --- upper body (origin at the waist) ---
+const upper = new THREE.Group(); upper.rotation.order = 'YXZ'; player.add(upper);
+blk(M.flannel, 0.74, 0.6, 0.42, 0, 0.36, 0, upper);             // jacket
+blk(M.flannel, 0.84, 0.26, 0.46, 0, 0.62, 0, upper);            // shoulder yoke
+blk(M.lining, 0.5, 0.1, 0.4, 0, 0.78, -0.02, upper);            // sherpa collar
+blk(M.vest, 0.6, 0.4, 0.07, 0, 0.38, 0.22, upper);              // chest rig
+for (const x of [-0.17, 0, 0.17]) blk(M.vestDk, 0.15, 0.17, 0.08, x, 0.33, 0.28, upper); // mag pouches
+blk(M.vest, 0.6, 0.48, 0.06, 0, 0.42, -0.23, upper);            // rig back panel
+for (const x of [-0.21, 0.21]) blk(M.vest, 0.12, 0.05, 0.5, x, 0.77, 0, upper); // shoulder straps
+blk(M.canvas, 0.48, 0.42, 0.18, 0, 0.36, -0.33, upper);         // pack
+blk(M.vestDk, 0.3, 0.14, 0.06, 0, 0.27, -0.44, upper);          // pack pocket
+blk(M.bedroll, 0.68, 0.17, 0.17, 0, 0.66, -0.36, upper);        // bedroll
+for (const x of [-0.2, 0.2]) blk(M.leather, 0.05, 0.19, 0.19, x, 0.66, -0.36, upper, 0.01); // bedroll straps
+
+// head turns back toward the aim line from the bladed torso
+const head = new THREE.Group(); head.position.set(0, 0.8, 0.02); head.rotation.order = 'YXZ'; upper.add(head);
+blk(M.skin, 0.2, 0.14, 0.2, 0, 0.04, 0, head);                  // neck
+blk(M.skin, 0.52, 0.5, 0.5, 0, 0.32, 0, head);                  // head
+blk(M.hair, 0.54, 0.2, 0.2, 0, 0.36, -0.17, head);              // hair at the back
+for (const x of [-0.25, 0.25]) blk(M.beard, 0.05, 0.2, 0.3, x, 0.19, 0.08, head, 0.015); // beard along the jaw
+blk(M.beard, 0.46, 0.12, 0.06, 0, 0.12, 0.24, head, 0.02);      // beard
+blk(M.beard, 0.2, 0.04, 0.03, 0, 0.21, 0.26, head, 0.01);       // moustache
+blk(M.skin, 0.08, 0.1, 0.07, 0, 0.27, 0.27, head, 0.015);       // nose
+for (const x of [-0.12, 0.12]) {
+  blk(M.eye, 0.07, 0.07, 0.02, x, 0.34, 0.255, head, 0.005);    // eyes
+  blk(M.hair, 0.13, 0.04, 0.03, x, 0.41, 0.255, head, 0.008);   // brows
+  blk(M.skin, 0.05, 0.11, 0.1, x * 2.25, 0.32, 0, head, 0.012); // ears
+}
+blk(M.cuff, 0.58, 0.1, 0.56, 0, 0.49, -0.01, head);             // beanie cuff
+blk(M.beanie, 0.55, 0.2, 0.53, 0, 0.6, -0.01, head);            // beanie
+blk(M.beanie, 0.18, 0.06, 0.18, 0, 0.72, -0.01, head, 0.02);    // knit top
+
+// --- rifle: origin at the butt plate, barrel along +Z ---
+const gun = new THREE.Group(); gun.rotation.order = 'YXZ'; player.add(gun);
+blk(M.rubber, 0.13, 0.19, 0.04, 0, -0.02, 0.02, gun, 0.01);     // butt pad
+blk(M.wood, 0.12, 0.17, 0.24, 0, -0.02, 0.15, gun);             // stock
+blk(M.wood, 0.1, 0.2, 0.1, 0, -0.11, 0.29, gun).rotation.x = 0.35; // pistol grip
+blk(M.metal, 0.14, 0.15, 0.4, 0, 0.03, 0.44, gun);              // receiver
+blk(M.metal, 0.04, 0.03, 0.12, 0, -0.07, 0.37, gun, 0.01);      // trigger guard
+const mag = blk(M.metal, 0.09, 0.24, 0.12, 0, -0.14, 0.52, gun); mag.rotation.x = -0.12;
+blk(M.wood, 0.13, 0.13, 0.36, 0, 0.01, 0.8, gun);               // handguard
+blk(M.metal, 0.06, 0.06, 0.46, 0, 0.03, 1.18, gun, 0.015);      // barrel
+blk(M.metal, 0.085, 0.085, 0.08, 0, 0.03, 1.42, gun, 0.015);    // muzzle brake
+blk(M.metal, 0.03, 0.07, 0.03, 0, 0.09, 1.34, gun, 0.008);      // front sight
+blk(M.rubber, 0.075, 0.075, 0.4, 0, 0.17, 0.46, gun, 0.02);     // scope tube
+blk(M.rubber, 0.1, 0.1, 0.08, 0, 0.17, 0.28, gun, 0.02);        // eyepiece
+blk(M.rubber, 0.11, 0.11, 0.09, 0, 0.17, 0.66, gun, 0.02);      // objective bell
+blk(M.lens, 0.08, 0.08, 0.01, 0, 0.17, 0.706, gun, 0.004);      // lens glint
+for (const z of [0.38, 0.56]) blk(M.metal, 0.04, 0.07, 0.04, 0, 0.11, z, gun, 0.01); // scope rings
+const GRIP_R = new THREE.Vector3(0, -0.1, 0.3);    // firing hand on the pistol grip
+const GRIP_L = new THREE.Vector3(0, -0.07, 0.74);  // support hand under the handguard
+const MAG_Y = mag.position.y;
+const MAG_BASE = new THREE.Vector3(0, -0.29, 0.53); // bottom of the seated magazine
+const EJECT = new THREE.Vector3(-0.08, 0.06, 0.48); // ejection port (right side)
+// the fresh magazine the support hand brings up from the chest rig
+const spareMag = new THREE.Mesh(mag.geometry, M.metal); spareMag.castShadow = true; player.add(spareMag);
+// bullets spawn here
+const muzzle = new THREE.Object3D(); muzzle.position.set(0, 0.03, 1.47); gun.add(muzzle);
+
+// --- arms: built along local Y, laid between the joints every frame ---
+const arms = [1, -1].map(side => {
+  const up = blk(M.flannel, 0.2, UPPER_ARM + 0.1, 0.21, 0, 0, 0, player);
+  blk(M.flannel, 0.25, 0.24, 0.25, 0, UPPER_ARM / 2, 0, up);         // shoulder
+  const fore = blk(M.flannel, 0.18, FOREARM + 0.08, 0.19, 0, 0, 0, player);
+  blk(M.canvas, 0.21, 0.08, 0.22, 0, -FOREARM / 2 + 0.05, 0, fore);  // rolled cuff
+  const hand = blk(M.skin, 0.14, 0.15, 0.17, 0, 0, 0, player);
+  return {
+    side, up, fore, hand,
+    shoulder: new THREE.Vector3(side * 0.41, 0.7, 0),
+    pole: side > 0 ? new THREE.Vector3(0.5, -1, -0.1) : new THREE.Vector3(-0.8, -1, -0.5), // elbows down & out
+    sh: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(),
+  };
+});
+
+// --- muzzle flash: a real light (with shadows) plus an additive star of blocks and a soft glow ---
+const FLASH_COLOR = 0xffa64d, FLASH_HOT = 0xff6a2a; // normal / DOUBLE DAMAGE
+const muzzleLight = new THREE.PointLight(FLASH_COLOR, 0, 14, 2);
+muzzleLight.castShadow = true;
+muzzleLight.shadow.mapSize.set(512, 512);
+muzzleLight.shadow.camera.near = 0.1;
+muzzleLight.shadow.bias = -0.004;
+// only re-rendered on frames the flash is lit, so an idle gun costs no shadow passes
+muzzleLight.shadow.autoUpdate = false;
+muzzleLight.shadow.needsUpdate = true;
+scene.add(muzzleLight);
+
+function glowTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.25, 'rgba(255,255,255,0.45)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const additive = color => new THREE.MeshBasicMaterial({
+  color, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false,
+});
+const flashCoreMat = additive(0xfff3d0), flashFireMat = additive(FLASH_COLOR);
+// four-sided cone, base at the origin, tip at +Z: a faceted tongue of flame
+const FLAME = new THREE.ConeGeometry(0.5, 1, 4).rotateX(Math.PI / 2).translate(0, 0, 0.5);
+const flash = new THREE.Group(); flash.visible = false; muzzle.add(flash);
+const flashCore = new THREE.Mesh(new THREE.OctahedronGeometry(0.5), flashCoreMat); flash.add(flashCore);
+const flashSpikes = [];
+for (let i = 0; i < 6; i++) {
+  // 0: white-hot core jet, 1: the orange jet around it, 2-5: petals fanning out to the sides
+  const pivot = new THREE.Group();
+  pivot.rotation.z = i * Math.PI / 2 + Math.PI / 4;
+  const tilt = new THREE.Group(); tilt.rotation.x = i > 1 ? -1.05 : 0; pivot.add(tilt);
+  const spike = new THREE.Mesh(FLAME, i ? flashFireMat : flashCoreMat); tilt.add(spike);
+  flash.add(pivot);
+  flashSpikes.push(spike);
+}
+const flashGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTexture(), color: FLASH_COLOR, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+}));
+flashGlow.position.z = 0.15;
+flash.add(flashGlow);
+scene.add(player);
+
+// --- shell casings, dropped magazines and gun smoke ---
+const debris = [];
+const casingGeo = bevelBox(0.05, 0.05, 0.12, 0.012);
+const smokeMats = Array.from({ length: 24 }, () =>
+  new THREE.MeshStandardMaterial({ color: 0x8d8f94, roughness: 1, transparent: true, opacity: 0, depthWrite: false }));
+let smokeI = 0;
+function spawnDebris(mesh, vel, o) {
+  mesh.userData = { vel, spin: o.spin || new THREE.Vector3(), life: o.life, max: o.life, bounce: o.bounce, smoke: o.smoke, size: mesh.scale.clone() };
+  scene.add(mesh);
+  debris.push(mesh);
+}
+function updateDebris(dt) {
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const d = debris[i], u = d.userData;
+    u.life -= dt;
+    if (u.smoke) {
+      // puffs swell, rise and thin out
+      const k = 1 - u.life / u.max;
+      d.scale.setScalar(u.smoke * (1 + k * 2.5));
+      d.material.opacity = 0.32 * (1 - k) * (1 - k);
+      u.vel.multiplyScalar(Math.exp(-3 * dt));
+      d.position.addScaledVector(u.vel, dt);
+      d.position.y += 0.5 * dt;
+    } else {
+      u.vel.y -= 16 * dt;
+      d.position.addScaledVector(u.vel, dt);
+      d.rotation.x += u.spin.x * dt; d.rotation.y += u.spin.y * dt; d.rotation.z += u.spin.z * dt;
+      if (d.position.y < u.bounce) {
+        // clatter on the boards, then lie flat
+        d.position.y = u.bounce;
+        u.vel.set(u.vel.x * 0.45, Math.abs(u.vel.y) > 1.5 ? -u.vel.y * 0.35 : 0, u.vel.z * 0.45);
+        u.spin.multiplyScalar(0.4);
+        if (u.vel.y === 0) { u.spin.set(0, 0, 0); d.rotation.x = 0; d.rotation.z = Math.round(d.rotation.z / Math.PI) * Math.PI; }
+      }
+      if (u.life < 0.4) d.scale.copy(u.size).multiplyScalar(Math.max(0.01, u.life / 0.4)); // shrink away
+    }
+    if (u.life <= 0) { scene.remove(d); debris.splice(i, 1); }
+  }
+}
+
+// --- animation state ---
+const rig = {
+  phase: 0,      // gait cycle, 0..1
+  gait: 0,       // 0 standing .. 1 full stride
+  turnW: 0,      // stepping in place while turning on the spot
+  turning: false,
+  hipYaw: 0,     // lower body's world yaw
+  back: false,   // backpedaling (hips face away from the travel direction)
+  stride: new THREE.Vector3(0, 0, 1), // travel direction in hip space
+  leanF: 0, leanS: 0,
+  kick: 0,       // recoil, 1 on the shot
+  flash: 0,      // muzzle flash, 1 on the shot
+  flashPeak: 0,
+  reload: 0,     // reload pose weight
+  magDropped: false,
+  t: 0,
+};
+const BETA = 0.38;      // fraction of the gait cycle each boot spends planted (under half: a run)
+const HIP_MAX = 1.0;    // furthest the hips turn away from the aim (rad)
+const IDLE_HIP = -0.35; // standing: hips bladed, left foot leading
+const BLADE = -0.62;    // torso turned so the left shoulder leads toward the target
+const POCKET = new THREE.Vector3(-0.13, 0.6, 0.22);   // right shoulder pocket the stock sits in (upper-local)
+const POUCH = new THREE.Vector3(0.17, 0.33, 0.36);    // chest-rig pouch the spare mag comes from (upper-local)
+const KNEE_POLE = new THREE.Vector3(0, 0, 1);
+
+const wrapA = a => a - Math.round(a / (Math.PI * 2)) * Math.PI * 2;
+const damp = (a, b, k, dt) => a + (b - a) * (1 - Math.exp(-k * dt));
+const ease = t => t * t * (3 - 2 * t);
+
+// where one foot is in its gait cycle p (0..1): planted for the first `beta` of it,
+// sliding back under the body (s: 0.5 -> -0.5 of the stride), then lifted and
+// carried forward. Shared by the survivor and the zombies.
+const _foot = { s: 0, lift: 0, pitch: 0 };
+function footCycle(p, beta) {
+  if (p < beta) {
+    _foot.s = 0.5 - p / beta; _foot.lift = 0; _foot.pitch = 0;
+  } else {
+    const t = (p - beta) / (1 - beta);
+    _foot.s = -0.5 + ease(t);
+    _foot.lift = Math.sin(Math.PI * t);
+    _foot.pitch = 0.6 * (1 - t) * (1 - t) - 0.3 * t * t; // toe-off, then heel first
+  }
+  return _foot;
+}
+
+const _ikD = new THREE.Vector3(), _ikP = new THREE.Vector3();
+// two-bone IK: from joint `a`, reach toward `t` with bones l1 then l2, bending
+// the middle joint toward `pole`. Writes the middle joint into `out`.
+function ik2(a, t, l1, l2, pole, out) {
+  _ikD.subVectors(t, a);
+  const d = THREE.MathUtils.clamp(_ikD.length(), Math.abs(l1 - l2) + 1e-3, l1 + l2 - 1e-3);
+  _ikD.normalize();
+  const x = (l1 * l1 - l2 * l2 + d * d) / (2 * d); // law of cosines: distance along the reach
+  _ikP.copy(pole).addScaledVector(_ikD, -pole.dot(_ikD)).normalize();
+  return out.copy(a).addScaledVector(_ikD, x).addScaledVector(_ikP, Math.sqrt(Math.max(0, l1 * l1 - x * x)));
+}
+const _bx = new THREE.Vector3(), _by = new THREE.Vector3(), _bz = new THREE.Vector3(), _bm = new THREE.Matrix4();
+// lay a limb block (built along local Y) from joint `a` to joint `b`, front toward `face`
+function bone(mesh, a, b, face) {
+  _by.subVectors(a, b).normalize();
+  _bz.copy(face).addScaledVector(_by, -face.dot(_by));
+  if (_bz.lengthSq() < 1e-6) _bz.set(0, 0, 1);
+  _bz.normalize();
+  _bx.crossVectors(_by, _bz);
+  mesh.quaternion.setFromRotationMatrix(_bm.makeBasis(_bx, _by, _bz));
+  mesh.position.addVectors(a, b).multiplyScalar(0.5);
+}
+
+// called by fire(): kick the rifle back, light the flash, spit a casing and some smoke
+function muzzleFlash(hot) {
+  rig.kick = 1;
+  rig.flash = 1;
+  rig.flashPeak = 40 + Math.random() * 20;
+  const color = hot ? FLASH_HOT : FLASH_COLOR;
+  muzzleLight.color.setHex(color);
+  flashFireMat.color.setHex(color);
+  flashGlow.material.color.setHex(color);
+  // a different star every shot
+  flash.rotation.z = Math.random() * Math.PI;
+  flash.scale.setScalar(0.85 + Math.random() * 0.4);
+  flashCore.scale.setScalar(0.16 + Math.random() * 0.06);
+  flashSpikes.forEach((s, i) => {
+    const len = i > 1 ? 0.2 + Math.random() * 0.22 : (i ? 0.65 : 0.4) + Math.random() * 0.35;
+    const w = i > 1 ? 0.09 : i ? 0.24 : 0.13;
+    s.scale.set(w, w, len);
+  });
+  flashGlow.scale.setScalar(2 + Math.random() * 0.6);
+
+  gun.updateWorldMatrix(true, false);
+  // brass flips out of the ejection port to the right
+  const casing = new THREE.Mesh(casingGeo, M.brass);
+  casing.position.copy(EJECT).applyMatrix4(gun.matrixWorld);
+  casing.quaternion.setFromRotationMatrix(gun.matrixWorld);
+  const right = new THREE.Vector3(-1, 0, 0).transformDirection(gun.matrixWorld);
+  const back = new THREE.Vector3(0, 0, -1).transformDirection(gun.matrixWorld);
+  const vel = right.multiplyScalar(2.4 + Math.random() * 1.2).addScaledVector(back, 0.6).add(new THREE.Vector3(0, 3 + Math.random(), 0));
+  spawnDebris(casing, vel, {
+    life: 2.5, bounce: 0.025,
+    spin: new THREE.Vector3(Math.random() * 20 - 10, Math.random() * 20 - 10, Math.random() * 20 - 10),
+  });
+  // a puff of smoke from the muzzle
+  const smoke = new THREE.Mesh(BOX, smokeMats[smokeI++ % smokeMats.length]);
+  muzzle.getWorldPosition(smoke.position);
+  smoke.rotation.set(Math.random() * 3, Math.random() * 3, 0);
+  const fwd = new THREE.Vector3(0, 0, 1).transformDirection(gun.matrixWorld);
+  spawnDebris(smoke, fwd.multiplyScalar(1.6), { life: 0.55, smoke: 0.14 + Math.random() * 0.06 });
+}
+
+const _v = new THREE.Vector3(), _w = new THREE.Vector3(), _gR = new THREE.Vector3(), _gL = new THREE.Vector3();
+// the support hand's path through a reload: [u (0..1 of the reload), point, its space]
+const MAG_OUT = MAG_BASE.clone().setY(MAG_BASE.y - 0.24), MAG_LINEUP = MAG_BASE.clone().setY(MAG_BASE.y - 0.2);
+const RELOAD_PATH = [
+  [0, GRIP_L, 'gun'],       // on the handguard
+  [0.12, MAG_BASE, 'gun'],  // grab the mag
+  [0.22, MAG_OUT, 'gun'],   // rip it out
+  [0.45, POUCH, 'upper'],   // fresh one off the chest rig
+  [0.55, POUCH, 'upper'],
+  [0.78, MAG_LINEUP, 'gun'], // line it up under the magwell
+  [0.95, MAG_BASE, 'gun'],  // seat it
+];
+const _ra = new THREE.Vector3(), _rb = new THREE.Vector3();
+function reloadHand(u, out) {
+  const at = (k, v) => v.copy(RELOAD_PATH[k][1]).applyMatrix4(RELOAD_PATH[k][2] === 'gun' ? gun.matrix : upper.matrix);
+  let i = RELOAD_PATH.length - 1;
+  while (i > 0 && u < RELOAD_PATH[i][0]) i--;
+  if (i === RELOAD_PATH.length - 1) return at(i, out);
+  const t = (u - RELOAD_PATH[i][0]) / (RELOAD_PATH[i + 1][0] - RELOAD_PATH[i][0]);
+  return out.copy(at(i, _ra)).lerp(at(i + 1, _rb), ease(t));
+}
+
+// pose the whole rig for this frame. (mx, mz) is the survivor's world velocity.
+function animatePlayer(dt, mx, mz) {
+  const pace = Math.min(1, Math.hypot(mx, mz) / state.speed);
+  const moving = pace > 0.05;
+  const aim = player.rotation.y;
+  rig.t += dt;
+  rig.gait = damp(rig.gait, pace, moving ? 9 : 7, dt);
+
+  // --- lower-body heading: the hips turn toward the travel direction (or away
+  // from it when backpedaling) but never more than HIP_MAX off the aim, and the
+  // feet step along whatever direction is left over ---
+  const moveYaw = Math.atan2(mx, mz);
+  let hipTarget = rig.hipYaw;
+  if (moving) {
+    const rel = wrapA(moveYaw - aim);
+    if (rig.back ? Math.abs(rel) < 1.25 : Math.abs(rel) > 1.9) rig.back = !rig.back; // hysteresis
+    hipTarget = aim + THREE.MathUtils.clamp(rig.back ? wrapA(rel - Math.PI) : rel, -HIP_MAX, HIP_MAX);
+    rig.turning = false;
+  } else {
+    // standing: feet stay planted until the aim twists the hips too far, then step around
+    const idle = aim + IDLE_HIP;
+    if (Math.abs(wrapA(idle - rig.hipYaw)) > 0.8) rig.turning = true;
+    if (rig.turning) {
+      hipTarget = idle;
+      if (Math.abs(wrapA(idle - rig.hipYaw)) < 0.06) rig.turning = false;
+    }
+  }
+  rig.hipYaw = wrapA(rig.hipYaw + wrapA(hipTarget - rig.hipYaw) * (1 - Math.exp(-10 * dt)));
+  const hipRel = wrapA(rig.hipYaw - aim);
+  lower.rotation.y = hipRel;
+  if (moving) { const s = moveYaw - rig.hipYaw; rig.stride.set(Math.sin(s), 0, Math.cos(s)); }
+
+  // --- gait clock: cadence rises gently with speed (FLEET FOOT) ---
+  rig.turnW = damp(rig.turnW, rig.turning ? 1 : 0, 12, dt);
+  const drive = Math.max(rig.gait, rig.turnW * 0.7);
+  const freq = 2.45 * Math.sqrt(state.speed / PLAYER_SPEED); // strides per second
+  if (drive > 0.02) rig.phase = (rig.phase + freq * dt) % 1;
+  const ph = rig.phase * Math.PI * 2;
+  // stride length is what the speed asks for, capped at what the legs can reach
+  const L = Math.min(0.86, state.speed * BETA / freq) * rig.gait;
+  const liftH = 0.2 * rig.gait + 0.1 * rig.turnW;
+
+  // --- pelvis: lowest as each boot takes the weight, highest in between ---
+  const bob = -0.04 * rig.gait * Math.cos(2 * (ph - Math.PI * BETA));
+  const pelvisY = HIP_H - 0.11 * rig.gait + bob; // runners sit lower, which buys the legs reach
+  pelvis.position.y = pelvisY;
+  pelvis.rotation.y = 0.14 * rig.gait * Math.sin(ph) * rig.stride.z; // hips swing with the legs
+  pelvis.rotation.z = 0.05 * rig.gait * Math.sin(ph);                // hip drop
+  pelvis.updateMatrix();
+
+  // --- legs: each boot is planted for BETA of the cycle, then arcs forward ---
+  for (const leg of legs) {
+    const p = (rig.phase + leg.phase) % 1;
+    const { s, lift, pitch } = footCycle(p, BETA);
+    if (p < leg.prev && drive > 0.3) audio.step();    // a footfall each time a boot lands
+    leg.prev = p;
+    const restZ = leg.side > 0 ? 0.12 : -0.1;          // standing: left foot leads
+    leg.foot.set(leg.side * (0.17 + 0.03 * (1 - rig.gait)), ANKLE_H + lift * liftH, restZ * (1 - rig.gait))
+      .addScaledVector(rig.stride, s * L);
+    leg.hipP.copy(leg.hip).applyMatrix4(pelvis.matrix);
+    ik2(leg.hipP, leg.foot, THIGH, SHIN, KNEE_POLE, leg.knee);
+    leg.ankle.subVectors(leg.foot, leg.knee).normalize().multiplyScalar(SHIN).add(leg.knee);
+    bone(leg.thigh, leg.hipP, leg.knee, KNEE_POLE);
+    bone(leg.shin, leg.knee, leg.ankle, KNEE_POLE);
+    leg.boot.position.copy(leg.ankle);
+    leg.boot.rotation.set(pitch * rig.gait * Math.sign(rig.stride.z || 1), leg.side * 0.08, 0);
+  }
+
+  // --- upper body: bladed toward the gun, half-following the hips, leaning into the run ---
+  const breathe = Math.sin(rig.t * 2.1) * (1 - rig.gait);
+  const tw = BLADE + 0.3 * (hipRel - BLADE) - 0.07 * rig.gait * Math.sin(ph) * rig.stride.z;
+  const travel = moveYaw - (aim + tw);
+  rig.leanF = damp(rig.leanF, moving ? Math.cos(travel) : 0, 8, dt);
+  rig.leanS = damp(rig.leanS, moving ? Math.sin(travel) : 0, 8, dt);
+  rig.kick *= Math.exp(-14 * dt);
+  upper.position.set(0, pelvisY + 0.1 + 0.006 * breathe, 0);
+  upper.rotation.set(0.05 + 0.1 * rig.leanF * rig.gait - 0.08 * rig.kick, tw, -0.07 * rig.leanS * rig.gait);
+  upper.updateMatrix();
+
+  // --- reload: tip the rifle in, strip the mag, pull a fresh one off the chest rig ---
+  rig.reload = damp(rig.reload, state.reloading ? 1 : 0, state.reloading ? 14 : 9, dt);
+  const rl = ease(rig.reload);
+  const u = state.reloading ? state.reloadT / state.reloadTime : 1;
+  head.rotation.set(0.1 + 0.32 * rl, -tw * 0.85 + 0.25 * rl, 0);
+
+  // --- rifle: butt in the shoulder pocket, barrel down the aim line ---
+  _v.copy(POCKET).applyMatrix4(upper.matrix);
+  gun.position.set(_v.x + 0.1 * rl, _v.y - 0.1 * rl + 0.012 * breathe, _v.z - 0.11 * rig.kick - 0.08 * rl);
+  gun.rotation.set(-0.16 * rig.kick - 0.35 * rl + 0.01 * Math.sin(rig.t * 1.3), 0.15 * rl, 0.65 * rl);
+  gun.updateMatrix();
+
+  // magazine: rides out with the hand, drops free, the spare rides in from the pouch
+  if (!state.reloading || u < 0.12) rig.magDropped = false;
+  let magDrop = 0;
+  if (state.reloading && u >= 0.12 && u < 0.22) magDrop = 0.24 * ease((u - 0.12) / 0.1);
+  if (state.reloading && u >= 0.78) magDrop = 0.2 * (1 - ease(Math.min(1, (u - 0.78) / 0.17)));
+  mag.position.y = MAG_Y - magDrop;
+  mag.visible = !state.reloading || u < 0.22 || u >= 0.78;
+  if (state.reloading && u >= 0.22 && !rig.magDropped) {
+    rig.magDropped = true;
+    const old = new THREE.Mesh(mag.geometry, M.metal);
+    mag.getWorldPosition(old.position); mag.getWorldQuaternion(old.quaternion);
+    spawnDebris(old, new THREE.Vector3(0, -1, 0), { life: 4, bounce: 0.05, spin: new THREE.Vector3(3, 0, 2) });
+  }
+
+  // hands: the firing hand never leaves the grip; the support hand works the reload
+  _gR.copy(GRIP_R).applyMatrix4(gun.matrix);
+  _gL.copy(GRIP_L).applyMatrix4(gun.matrix);
+  if (rig.reload > 0.001) _gL.lerp(reloadHand(u, _w), rl);
+  for (const arm of arms) {
+    arm.sh.copy(arm.shoulder).applyMatrix4(upper.matrix);
+    const target = arm.side < 0 ? _gR : _gL;
+    ik2(arm.sh, target, UPPER_ARM, FOREARM, arm.pole, arm.elbow);
+    arm.wrist.subVectors(target, arm.elbow).normalize().multiplyScalar(FOREARM).add(arm.elbow);
+    bone(arm.up, arm.sh, arm.elbow, arm.pole);
+    bone(arm.fore, arm.elbow, arm.wrist, arm.pole);
+    arm.hand.position.copy(arm.wrist);
+    arm.hand.quaternion.copy(gun.quaternion);
+  }
+  spareMag.visible = state.reloading && u >= 0.45 && u < 0.78;
+  if (spareMag.visible) {
+    spareMag.quaternion.copy(gun.quaternion);
+    spareMag.position.copy(arms[0].wrist).add(_w.set(0, 0.13, 0).applyQuaternion(gun.quaternion));
+  }
+
+  // --- muzzle flash: a few frames of fire, a real light with a fast falloff ---
+  rig.flash = Math.max(0, rig.flash - dt / 0.07);
+  const f = rig.flash;
+  flash.visible = f > 0.3;
+  flashCoreMat.opacity = Math.min(1, f * 1.4);
+  flashFireMat.opacity = Math.min(1, f * 1.2);
+  flashGlow.material.opacity = 0.85 * f;
+  muzzleLight.intensity = rig.flashPeak * f * f;
+  if (f > 0) {
+    muzzle.getWorldPosition(muzzleLight.position);
+    muzzleLight.position.x += Math.sin(aim) * 0.4; // just ahead of the brake, so the barrel
+    muzzleLight.position.z += Math.cos(aim) * 0.4; // doesn't shadow the shooter
+    muzzleLight.shadow.needsUpdate = true;
+  }
+}
+
+// ===================================================================
+// STATE
+// ===================================================================
+const state = {
+  running: false,
+  paused: false,
+  hp: 3,
+  maxHp: 3,
+  kills: 0,
+  shots: 0, // shots fired this run (for the PACIFIST achievement)
+  wave: 0,
+  mag: 8,
+  magSize: 8,
+  reloading: false,
+  reloadT: 0,
+  reloadTime: 1.2,
+  fireCd: 0,
+  fireRate: 0.13,
+  dmgCd: 0,
+  // upgradeable stats (see UPGRADES)
+  damage: 1,
+  pierce: 0,     // extra zombies each bullet passes through
+  spread: 0,     // extra bullets per shot
+  speed: 6.2,
+  dropBonus: 0,
+  upgrades: {},  // upgrade id -> times taken this run
+  // timed power-ups from drops (seconds remaining)
+  pDamage: 0,
+  pAmmo: 0,
+  sinceDrop: 0,  // kills since the last drop (pity timer)
+  // wave control
+  toSpawn: 0,
+  spawnTimer: 0,
+  intermission: 0,
+  choosing: false, // wave cleared, waiting on an upgrade pick
+  zombieSpeed: 2.2,
+  zombieHp: 2,
+  shake: 0,
+};
+
+const bullets = [];
+const zombies = [];
+const particles = [];
+
+// reusable materials for spawned objects
+// tracers: a white-hot core inside a softer colored streak, both additive so they glow
+const glowMat = (color, opacity) => new THREE.MeshBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false });
+const tracerCore = glowMat(0xfff4d6, 1), tracerGlow = glowMat(0xffb04a, 0.45), tracerGlowHot = glowMat(0xff5a1e, 0.6); // hot: DOUBLE DAMAGE
+function makeTracer(hot) {
+  const b = new THREE.Group(); // +Z is the direction of travel; the streak trails behind the head
+  const core = new THREE.Mesh(BOX, tracerCore); core.scale.set(0.05, 0.05, 0.9); core.position.z = -0.35;
+  const glow = new THREE.Mesh(BOX, hot ? tracerGlowHot : tracerGlow); glow.scale.set(0.15, 0.15, 1.05); glow.position.z = -0.42;
+  b.add(core, glow);
+  return b;
+}
+const bloodMat = new THREE.MeshStandardMaterial({ color: 0x6a0e0e, roughness: 0.35 }); // wet, so the flash glints off it
+
+// ===================================================================
+// INPUT
+// ===================================================================
+const keys = {};
+const mouse = new THREE.Vector2();
+let firing = false;
+let mouseFiring = false;
+const touchPointers = new Map();
+const touchMove = new THREE.Vector2();
+const touchControls = document.getElementById('touchControls');
+const touchStick = document.getElementById('touchStick');
+const touchKnob = document.getElementById('touchKnob');
+let touchAiming = false;
+let mouseAimActive = !touchMode;
+if (touchMode) document.body.classList.add('touch-device');
+const aimPoint = new THREE.Vector3();
+const aimPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.9);
+const raycaster = new THREE.Raycaster();
+
+function updateFiring() {
+  touchAiming = [...touchPointers.values()].some(p => p.type === 'aim');
+  firing = mouseFiring || touchAiming;
+}
+function setTouchAim(x, y) {
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = ((x - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((y - rect.top) / rect.height) * 2 + 1;
+}
+function clearTouchInput() {
+  touchPointers.clear();
+  touchMove.set(0, 0);
+  touchKnob.style.transform = 'translate(0, 0)';
+  updateFiring();
+}
+function updateTouchStick(pointer) {
+  const rect = touchStick.getBoundingClientRect();
+  const max = rect.width * 0.32;
+  if (!max) return;
+  const dx = pointer.x - (rect.left + rect.width / 2);
+  const dy = pointer.y - (rect.top + rect.height / 2);
+  const length = Math.hypot(dx, dy);
+  const scale = length > max ? max / length : 1;
+  const x = dx * scale / max, y = dy * scale / max;
+  const deadZone = 0.14;
+  touchMove.set(Math.abs(x) < deadZone ? 0 : x, Math.abs(y) < deadZone ? 0 : y);
+  touchKnob.style.transform = `translate(${dx * scale}px, ${dy * scale}px)`;
+}
+
+window.addEventListener('keydown', e => {
+  if (menu.key(e)) { e.preventDefault(); return; }
+  if (e.code === 'Enter' && !state.running && !document.getElementById('death').classList.contains('hidden')) return startGame();
+  keys[e.code] = true;
+  if (e.code === 'Escape' || e.code === 'KeyP') { if (!e.repeat) setPaused(!state.paused); return; }
+  if (state.paused) return;
+  if (e.code === 'KeyR') startReload();
+  if (state.choosing && /^Digit[1-3]$/.test(e.code)) choose(+e.code.slice(5) - 1);
+  if (e.code === 'KeyM') {
+    const m = audio.toggleMute();
+    document.getElementById('reloadHint').textContent = touchMode
+      ? (m ? 'TAP RELOAD   ·   MUTED' : 'TAP RELOAD   ·   TAP FIRE')
+      : (m ? '[R] RELOAD   ·   [M] MUTED' : '[R] RELOAD');
+  }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('mousemove', e => {
+  if (touchMode && e.sourceCapabilities?.firesTouchEvents) return;
+  mouseAimActive = true;
+  setTouchAim(e.clientX, e.clientY);
+});
+window.addEventListener('mousedown', () => { mouseFiring = true; updateFiring(); });
+window.addEventListener('mouseup', () => { mouseFiring = false; updateFiring(); });
+window.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'touch' || !state.running || state.paused || state.choosing) return;
+  mouseAimActive = false;
+  const target = e.target instanceof Element ? e.target : null;
+  if (target?.closest('#touchReload')) { e.preventDefault(); startReload(); return; }
+  if (target?.closest('#touchPause')) { e.preventDefault(); setPaused(true); return; }
+  const rect = touchStick.getBoundingClientRect();
+  const gameRect = canvas.getBoundingClientRect();
+  const overStick = e.clientX >= rect.left && e.clientX <= rect.right &&
+    e.clientY >= rect.top && e.clientY <= rect.bottom;
+  if (overStick) {
+    if ([...touchPointers.values()].some(p => p.type === 'move')) return;
+    const pointer = { type: 'move', x: e.clientX, y: e.clientY };
+    touchPointers.set(e.pointerId, pointer);
+    updateTouchStick(pointer);
+  } else if (e.clientX >= gameRect.left + gameRect.width * 0.42 || target?.closest('#touchFire')) {
+    const pointer = { type: 'aim', x: e.clientX, y: e.clientY };
+    touchPointers.set(e.pointerId, pointer);
+    setTouchAim(e.clientX, e.clientY);
+    updateFiring();
+  } else {
+    e.preventDefault();
+    return;
+  }
+  e.preventDefault();
+});
+window.addEventListener('pointermove', e => {
+  const pointer = touchPointers.get(e.pointerId);
+  if (!pointer) return;
+  pointer.x = e.clientX;
+  pointer.y = e.clientY;
+  if (pointer.type === 'move') updateTouchStick(pointer);
+  else setTouchAim(e.clientX, e.clientY);
+  e.preventDefault();
+});
+function releaseTouchPointer(e) {
+  const pointer = touchPointers.get(e.pointerId);
+  if (!pointer) return;
+  touchPointers.delete(e.pointerId);
+  if (pointer.type === 'move') {
+    touchMove.set(0, 0);
+    touchKnob.style.transform = 'translate(0, 0)';
+  }
+  updateFiring();
+}
+window.addEventListener('pointerup', releaseTouchPointer);
+window.addEventListener('pointercancel', releaseTouchPointer);
+document.getElementById('touchReload').addEventListener('click', startReload);
+document.getElementById('touchPause').addEventListener('click', () => setPaused(true));
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+// the death screen: go again, or back to the title
+document.getElementById('retryBtn').addEventListener('click', () => startGame());
+document.getElementById('deathQuitBtn').addEventListener('click', quitToTitle);
+document.getElementById('resumeBtn').addEventListener('click', () => setPaused(false));
+document.getElementById('quitBtn').addEventListener('click', quitToTitle);
+// alt-tabbing away mid-run pauses (and would otherwise leave WASD stuck down)
+window.addEventListener('blur', () => setPaused(true));
+document.getElementById('cards').addEventListener('click', e => {
+  const c = e.target.closest('.card');
+  if (c) choose(+c.dataset.i);
+});
+document.getElementById('cards').addEventListener('mouseover', e => {
+  const c = e.target.closest('.card');
+  if (c && !c.contains(e.relatedTarget) && state.choosing) audio.hover(+c.dataset.i);
+});
+
+// ===================================================================
+// HUD
+// ===================================================================
+const hud = {
+  wave: document.getElementById('waveNum'),
+  kills: document.getElementById('kills'),
+  zleft: document.getElementById('zleft'),
+  health: document.getElementById('health'),
+  powerups: document.getElementById('powerups'),
+  toast: document.getElementById('toast'),
+  picker: document.getElementById('picker'),
+  pickerTitle: document.getElementById('pickerTitle'),
+  pickerSub: document.getElementById('pickerSub'),
+  cards: document.getElementById('cards'),
+  mag: document.getElementById('mag'),
+  reloadBar: document.getElementById('reloadBar'),
+  reloadFill: document.getElementById('reloadFill'),
+  flash: document.getElementById('flash'),
+  banner: document.getElementById('banner'),
+  bannerText: document.getElementById('bannerText'),
+  bannerSub: document.getElementById('bannerSub'),
+};
+
+function updateHUD() {
+  hud.wave.textContent = state.wave;
+  hud.kills.textContent = state.kills;
+  const remaining = zombies.length + state.toSpawn;
+  hud.zleft.textContent = state.intermission > 0 || state.choosing ? '' : remaining + ' LEFT';
+  if (hud.health.children.length !== state.maxHp) hud.health.innerHTML = pixelIcon(UPGRADE_ICONS.heal, 'pip').repeat(state.maxHp);
+  [...hud.health.children].forEach((p, i) => p.classList.toggle('dead', i >= state.hp));
+  // power-up time left as a clock: 0:10 … 0:01
+  const clock = t => { const s = Math.ceil(t); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  let pu = '';
+  if (state.pDamage > 0) pu += `<div style="color:#ff7a2e">DOUBLE DAMAGE ${clock(state.pDamage)}</div>`;
+  if (state.pAmmo > 0) pu += `<div style="color:#e8d28a">BOTTOMLESS MAG ${clock(state.pAmmo)}</div>`;
+  hud.powerups.innerHTML = pu;
+  let m = '';
+  for (let i = 0; i < state.magSize; i++) {
+    m += `<span class="${i < state.mag ? 'live' : 'empty'}">▮</span>`;
+  }
+  hud.mag.innerHTML = m;
+  hud.reloadBar.classList.toggle('active', state.reloading);
+  if (state.reloading) hud.reloadFill.style.width = (state.reloadT / state.reloadTime * 100) + '%';
+}
+
+let flashT = 0;
+function damageFlash() { hud.flash.style.background = '#ff1e1e'; flashT = 0.4; state.shake = 0.5; }
+
+function showToast(text, color) {
+  hud.toast.textContent = text;
+  hud.toast.style.color = color;
+  hud.toast.style.opacity = 1;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { hud.toast.style.opacity = 0; }, 1400);
+}
+
+function showBanner(text, sub, dur = 1.6) {
+  hud.bannerText.textContent = text;
+  hud.bannerSub.textContent = sub || '';
+  hud.banner.style.opacity = 1;
+  clearTimeout(showBanner._t);
+  showBanner._t = setTimeout(() => { hud.banner.style.opacity = 0; }, dur * 1000);
+}
+
+// ===================================================================
+// WEAPON
+// ===================================================================
+function startReload() {
+  if (!state.running || state.reloading || state.mag === state.magSize) return;
+  state.reloading = true;
+  state.reloadT = 0;
+  audio.reloadOut();
+}
+function finishReload() {
+  state.reloading = false;
+  state.mag = state.magSize;
+  audio.reloadIn();
+}
+
+function fire() {
+  if (state.fireCd > 0 || state.reloading || state.mag <= 0 || !state.running) return;
+  if (state.pAmmo <= 0) {
+    state.mag--;
+    if (state.mag <= 0) startReload();
+  }
+  state.shots++;
+  state.fireCd = state.fireRate;
+
+  const aim = new THREE.Vector3(aimPoint.x - player.position.x, 0, aimPoint.z - player.position.z);
+  if (aim.lengthSq() < 1e-4) return;
+  aim.normalize();
+
+  // spawn at muzzle world position; BUCKSHOT fans extra bullets around the aim line
+  const mp = new THREE.Vector3();
+  muzzle.getWorldPosition(mp);
+  const count = 1 + state.spread;
+  for (let k = 0; k < count; k++) {
+    const a = (k - (count - 1) / 2) * 0.13;
+    const c = Math.cos(a), s = Math.sin(a);
+    const dir = new THREE.Vector3(aim.x * c - aim.z * s, 0, aim.x * s + aim.z * c);
+    const b = makeTracer(state.pDamage > 0);
+    b.position.copy(mp);
+    b.lookAt(mp.clone().add(dir));
+    b.userData = { dir, life: 0.9, pierce: state.pierce, hits: new Set() };
+    scene.add(b);
+    bullets.push(b);
+  }
+
+  muzzleFlash(state.pDamage > 0);
+  state.shake = Math.max(state.shake, 0.12);
+  audio.shot(state.pDamage > 0, state.spread);
+}
+
+// ===================================================================
+// ZOMBIES
+// ===================================================================
+// Built like the survivor (chamfered blocks, IK limbs, planted feet), but
+// each body part is baked into one vertex-colored mesh so a horde of 30
+// stays cheap: every zombie shares a handful of geometries and two materials.
+
+const Z_THIGH = 0.42, Z_SHIN = 0.4, Z_ANKLE = 0.11, Z_HIP = 0.9;
+const Z_UPPER_ARM = 0.4, Z_FOREARM = 0.39;
+// the rig is modeled in slightly smaller units than the survivor's: Z_SCALE brings its legs and
+// height to his, and Z_UPPER widens the torso and head to his shoulders, so they stand eye to eye
+const Z_SCALE = 1.08, Z_UPPER = 1.1;
+const GORE = 0x5c1010, BLOOD = 0x3a0807, BONE = 0xcfc4a2, SOCKET = 0x120a08;
+
+// four dead locals; skin stays in the sick greens so they read as zombies at a glance
+const ZOMBIE_LOOKS = [
+  { shirt: 0x4d6680, pants: 0x5a4632, skin: 0x7f9a66, hair: 0x2a2620, shoe: 0x2b2420 },                 // farmhand: denim shirt
+  { shirt: 0x5b6239, pants: 0x6b5f43, skin: 0x8aa67a, hair: 0x4a3a28, shoe: 0x3a2c1f, ribs: true },     // hunter: field jacket
+  { shirt: 0x9a9584, pants: 0x3a4a63, skin: 0x6f8a52, bald: true, tank: true, shoe: 0x1c1c1e, barefoot: 1 }, // tank top, one shoe gone
+  { shirt: 0x86703a, pants: 0x38383b, skin: 0x82a07c, hair: 0x1b1714, shoe: 0x242226, ribs: true },     // camper: mustard hoodie
+];
+const darker = (hex, k = 0.65) => new THREE.Color(hex).multiplyScalar(k).getHex();
+
+// bake every body part for one look. Limbs are built along Y around their
+// bone's midpoint (like the survivor's); the forearm carries the hand below it.
+function bakeZombie(L, seed) {
+  const rng = seeded(seed);
+  const skinDk = darker(L.skin, 0.72), shirtDk = darker(L.shirt), pantsDk = darker(L.pants);
+  const sleeve = L.tank ? L.skin : L.shirt;
+  const head = [
+    [0.46, 0.44, 0.44, 0, 0.24, 0, L.skin],                       // skull
+    [0.47, 0.06, 0.07, 0, 0.33, 0.2, skinDk],                     // heavy brow
+    [0.11, 0.08, 0.03, -0.11, 0.27, 0.215, SOCKET], [0.11, 0.08, 0.03, 0.11, 0.27, 0.215, SOCKET],
+    [0.06, 0.07, 0.04, 0, 0.2, 0.23, skinDk],                     // nose stump
+    [0.25, 0.03, 0.03, 0, 0.06, 0.225, BONE, 0, 0, 0, 0.01],      // upper teeth
+    [0.05, 0.1, 0.08, 0.235, 0.24, 0, L.skin],                    // one ear left
+    [0.03, 0.1, 0.13, -0.232, 0.17, 0.07, GORE, 0, 0, 0, 0.01],   // torn cheek
+  ];
+  if (L.bald) {
+    head.push([0.2, 0.03, 0.16, 0.06, 0.465, 0.03, GORE, 0, 0, 0, 0.01], [0.09, 0.03, 0.08, 0.07, 0.475, 0.03, BONE, 0, 0, 0, 0.01]); // scalp torn open
+  } else {
+    head.push([0.44, 0.16, 0.08, 0, 0.32, -0.2, L.hair]);        // matted hair at the back
+    for (let i = 0; i < 3; i++) head.push([0.12 + rng() * 0.08, 0.06, 0.12 + rng() * 0.08, (rng() - 0.5) * 0.28, 0.48, (rng() - 0.6) * 0.3, L.hair]); // clumps
+  }
+  const torso = [
+    [0.64, 0.6, 0.36, 0, 0.32, 0, L.shirt],                       // chest
+    [0.7, 0.18, 0.38, 0, 0.56, -0.01, L.tank ? L.skin : L.shirt],  // shoulders
+    [0.4, 0.2, 0.12, 0, 0.5, -0.2, L.tank ? L.skin : L.shirt],     // hunched back
+    [0.2, 0.12, 0.2, 0, 0.67, 0.04, L.skin],                      // neck
+    [0.15, 0.13, 0.39, -0.21, 0.0, 0, shirtDk, 0, 0, 0.25],        // torn hem
+    [0.12, 0.1, 0.39, 0.19, -0.01, 0, shirtDk, 0, 0, -0.2],
+    [0.18, 0.24, 0.02, -0.03, 0.47, 0.185, BLOOD],                // drool stain down the front
+    [0.2, 0.17, 0.04, 0.15, 0.3, 0.17, L.skin],                   // hole torn in the shirt
+    [0.12, 0.1, 0.03, 0.16, 0.3, 0.19, GORE],
+  ];
+  if (L.tank) torso.push([0.1, 0.18, 0.37, -0.17, 0.56, 0, L.shirt], [0.1, 0.18, 0.37, 0.17, 0.56, 0, L.shirt]); // straps
+  if (L.ribs) {
+    torso.push([0.26, 0.26, 0.04, -0.15, 0.33, 0.175, GORE]);     // ribs showing through
+    for (let k = 0; k < 3; k++) torso.push([0.24, 0.035, 0.03, -0.15, 0.25 + k * 0.08, 0.2, BONE, 0, 0, 0, 0.01]);
+  }
+  const pelvis = [
+    [0.52, 0.26, 0.32, 0, 0.02, 0, L.pants],
+    [0.54, 0.06, 0.34, 0, 0.13, 0, 0x2a221a, 0, 0, 0, 0.015],     // belt
+    [0.18, 0.16, 0.04, 0.12, 0.02, 0.17, L.tank ? L.shirt : shirtDk, 0, 0, 0.12], // shirt tail
+  ];
+  const upperArm = [[0.17, Z_UPPER_ARM + 0.06, 0.18, 0, 0, 0, sleeve]];
+  if (!L.tank) upperArm.push([0.19, 0.07, 0.2, 0, -Z_UPPER_ARM / 2 + 0.03, 0, shirtDk]); // ragged sleeve end
+  const hand = -Z_FOREARM / 2 - 0.06;
+  const forearm = [
+    [0.15, Z_FOREARM + 0.04, 0.16, 0, 0, 0, L.skin],
+    [0.03, 0.12, 0.1, 0.075, 0.05, 0, GORE, 0, 0, 0, 0.01],       // bite
+    [0.16, 0.14, 0.1, 0, hand, 0.01, skinDk],                     // hand
+  ];
+  for (const x of [-0.05, 0, 0.05]) forearm.push([0.035, 0.12, 0.035, x, hand - 0.12, 0.02 + rng() * 0.02, skinDk, 0.2 + rng() * 0.3, 0, 0, 0.008]); // clawed fingers
+  const thigh = [[0.21, Z_THIGH + 0.06, 0.23, 0, 0, 0, L.pants]];
+  const shin = [[0.19, Z_SHIN + 0.05, 0.21, 0, 0, 0, L.pants], [0.21, 0.07, 0.23, 0, -Z_SHIN / 2 + 0.02, 0, pantsDk]]; // frayed cuff
+  const shoe = [[0.22, 0.12, 0.34, 0, -0.05, 0.05, L.shoe], [0.23, 0.03, 0.35, 0, -0.1, 0.05, 0x141210, 0, 0, 0, 0.01]];
+  const bare = [[0.18, 0.08, 0.3, 0, -0.07, 0.06, skinDk], [0.16, 0.05, 0.06, 0, -0.09, 0.22, skinDk]];
+  const eyes = [[0.06, 0.045, 0.02, -0.11, 0.27, 0.225, 0xffffff, 0, 0, 0, 0.005], [0.06, 0.045, 0.02, 0.11, 0.27, 0.225, 0xffffff, 0, 0, 0, 0.005]];
+  const jaw = [
+    [0.36, 0.09, 0.3, 0, -0.015, 0.15, L.skin],                   // hangs from a hinge under the skull
+    [0.22, 0.025, 0.03, 0, 0.035, 0.29, BONE, 0, 0, 0, 0.01],     // lower teeth
+    [0.2, 0.05, 0.02, 0, -0.035, 0.305, BLOOD, 0, 0, 0, 0.01],    // bloody chin
+  ];
+  const b = parts => bakeBlocks(parts, rng);
+  return {
+    head: b(head), jaw: b(jaw), eyes: b(eyes), torso: b(torso), pelvis: b(pelvis),
+    upperArm: b(upperArm), forearm: b(forearm), thigh: b(thigh), shin: b(shin),
+    feet: [b(shoe), b(L.barefoot ? bare : shoe)], // [left, right]
+  };
+}
+const ZOMBIE_KITS = ZOMBIE_LOOKS.map((L, i) => bakeZombie(L, 7 + i * 31));
+const zombieSkin = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9 });
+// on a hit the whole body swaps to this for a beat (same shader, no recompile)
+const zombieHurt = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, emissive: 0xd8e8b0, emissiveIntensity: 0.45 });
+const zombieEyes = new THREE.MeshBasicMaterial({ color: 0xd9e06a }); // a faint sick glow in the dark
+const bloodPoolMat = new THREE.MeshStandardMaterial({ color: 0x3a0606, roughness: 0.25 }); // wet: catches the muzzle flash
+
+// Spawn points sit just past the edge of the gameplay view (worked out from where the
+// follow camera will be, whatever the window's shape), so nothing pops in on screen.
+const spawnCam = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
+const _sp = new THREE.Vector3();
+function offscreen(x, z) {
+  for (const y of [0, 2.2]) { // feet and head both out of frame
+    _sp.set(x, y, z).project(spawnCam);
+    if (_sp.z < 1 && Math.abs(_sp.x) < 1.08 && Math.abs(_sp.y) < 1.08) return false;
+  }
+  return true;
+}
+function spawnPoint(out) {
+  spawnCam.aspect = window.innerWidth / window.innerHeight;
+  spawnCam.updateProjectionMatrix();
+  spawnCam.position.copy(player.position).add(CAM_OFFSET);
+  spawnCam.lookAt(player.position.x, 0, player.position.z);
+  spawnCam.updateMatrixWorld();
+  const ang = Math.random() * Math.PI * 2, cx = Math.sin(ang), cz = Math.cos(ang);
+  let r = 12;
+  const along = r => [player.position.x + cx * r, player.position.z + cz * r];
+  // walk out along a random bearing until it's off screen and clear of the cabin
+  for (; r < 70; r += 1) {
+    const [x, z] = along(r);
+    if (offscreen(x, z) && (Math.abs(x) > EDGE + 1.5 || Math.abs(z) > EDGE + 1.5)) break;
+  }
+  [out.x, out.z] = along(r + 1.5 + Math.random() * 3);
+  out.y = 0;
+  pushOutOfSolids(out);
+  return out;
+}
+
+function spawnZombie(pos = spawnPoint(new THREE.Vector3())) {
+  const kit = ZOMBIE_KITS[(Math.random() * ZOMBIE_KITS.length) | 0];
+  const z = new THREE.Group();
+  z.rotation.order = 'YXZ';
+  const body = [];
+  const mesh = (geo, parent, mat = zombieSkin) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.castShadow = mat !== zombieEyes;
+    parent.add(m);
+    if (mat === zombieSkin) body.push(m);
+    return m;
+  };
+  const pelvis = mesh(kit.pelvis, z);
+  const upper = new THREE.Group(); upper.rotation.order = 'YXZ'; upper.scale.setScalar(Z_UPPER); z.add(upper); // waist pivot
+  mesh(kit.torso, upper);
+  const head = new THREE.Group(); head.position.set(0, 0.68, 0.06); head.rotation.order = 'YXZ'; upper.add(head);
+  mesh(kit.head, head);
+  const eyes = mesh(kit.eyes, head, zombieEyes);
+  const jaw = new THREE.Group(); jaw.position.set(0, 0, -0.06); head.add(jaw);
+  mesh(kit.jaw, jaw);
+  const side = s => ({
+    side: s,
+    upperArm: mesh(kit.upperArm, z), forearm: mesh(kit.forearm, z),
+    thigh: mesh(kit.thigh, z), shin: mesh(kit.shin, z), foot: mesh(kit.feet[s > 0 ? 0 : 1], z),
+    shoulder: new THREE.Vector3(s * 0.36, 0.58, 0), hip: new THREE.Vector3(s * 0.14, 0, 0),
+    sh: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(), reach: new THREE.Vector3(),
+    hipP: new THREE.Vector3(), knee: new THREE.Vector3(), ankle: new THREE.Vector3(), foot3: new THREE.Vector3(),
+  });
+  const limbs = [side(1), side(-1)];
+
+  z.position.set(pos.x, 0, pos.z);
+  z.scale.setScalar(Z_SCALE * (0.94 + Math.random() * 0.12));
+  const limp = Math.random() < 0.45 ? 0.5 + Math.random() * 0.5 : 0;
+  const pace = 0.85 + Math.random() * 0.3;
+  z.userData = {
+    hp: state.zombieHp,
+    pace,                                               // its speed relative to the wave's
+    speed: state.zombieSpeed * pace,
+    hurt: 0, body, eyes, pelvis, upper, head, jaw, limbs,
+    // gait personality
+    phase: Math.random(),
+    seed: Math.random() * 100,
+    limp,                                               // 0 = sound legs; else how badly one drags
+    limpSide: Math.random() < 0.5 ? 1 : -1,
+    hunch: 0.25 + Math.random() * 0.3,
+    tilt: (Math.random() - 0.5) * 0.5,                  // head lolls to one side
+    arms: Math.random() < 0.7 ? 2 : Math.random() < 0.85 ? 1 : 0, // how many arms reach (the rest hang)
+    flinch: 0, attack: 0, groan: 0,
+    gait: 1,       // 1 = walking, 0 = feet planted
+    swing: -1,     // seconds into a swing at the survivor; -1 = not swinging
+    swingCd: 0.15, struck: false, standing: false, swingAt: null, // swingAt: a door/window it's battering, else you
+    climb: -1,     // 0..1 through clambering in a window; -1 = not climbing
+    via: -1,       // which prop corner it's heading round (see routeAround)
+    stuckT: 0, stuckX: pos.x, stuckZ: pos.z, // progress check (see chaseZombie)
+    opening: null, // committed entry opening; null = re-pick on next outside frame
+    stage: 0,      // 0 = heading to outer waypoint, 1 = heading through the gap
+    heading: Math.atan2(-z.position.x, -z.position.z), // current facing, starts toward cabin
+    turn: 3.0 + Math.random() * 2.0,                   // max turn rate (rad/s), varied per zombie
+  };
+  z.rotation.y = z.userData.heading;
+  scene.add(z);
+  zombies.push(z);
+  return z;
+}
+
+// on a bullet hit: flash, flinch back, and snap the head
+function hitZombie(z) {
+  const u = z.userData;
+  u.hurt = 0.12;
+  u.flinch = 1;
+  for (const m of u.body) m.material = zombieHurt;
+}
+
+const Z_POLE_KNEE = new THREE.Vector3(0, 0, 1);
+const _zPole = new THREE.Vector3(), _zReach = new THREE.Vector3();
+// pose a zombie for this frame: a lurching, uneven shamble that turns into a
+// loping run on later waves, arms groping toward the survivor or hanging dead.
+// `dead` (0..1) goes limp as it dies; `sag` buckles the knees.
+function animateZombie(z, dt, near, dead = 0, sag = dead) {
+  const u = z.userData;
+  const fall = dead ? u.fallDir : 0; // +1 toppling forward, -1 backward
+  const live = 1 - dead;
+  const gait = u.gait * live; // 0 when it's standing its ground
+  const sp = u.speed * gait;
+  const run = THREE.MathUtils.clamp((u.speed - 3) / 2, 0, 1); // later waves lope instead of shamble
+  const freq = 1.1 + sp * 0.22;
+  const beta = 0.6 - 0.18 * run;
+  u.phase = (u.phase + freq * dt * live) % 1;
+  const ph = u.phase * Math.PI * 2;
+  const L = Math.min(0.7, sp * beta / freq);
+  const t = performance.now() / 1000 + u.seed;
+  u.flinch *= Math.exp(-7 * dt);
+  u.groan *= Math.exp(-2.5 * dt);
+  u.attack = damp(u.attack, near < 2.4 && u.swing < 0 ? live : 0, 6, dt);
+  // the swing: rear back with the arms up (-1), slam down and lunge (+1), recover
+  const sw = u.swing, rec = Z_SWING - Z_STRIKE - 0.1;
+  const blow = sw < 0 || dead ? 0
+    : sw < Z_STRIKE ? -ease(sw / Z_STRIKE)
+    : sw < Z_STRIKE + 0.1 ? -1 + 2 * ease((sw - Z_STRIKE) / 0.1)
+    : 1 - ease(Math.min(1, (sw - Z_STRIKE - 0.1) / rec));
+  const rear = Math.max(0, -blow), slam = Math.max(0, blow);
+  const clamber = u.climb >= 0 && !dead ? Math.sin(Math.PI * u.climb) : 0; // over a window sill
+
+  // pelvis: dips on every step, and drops hard onto the bad leg
+  const badStance = u.limp ? Math.max(0, Math.sin(ph + (u.limpSide > 0 ? 0 : Math.PI))) : 0;
+  const pelvisY = Z_HIP - 0.05 - 0.06 * run - 0.05 * Math.abs(Math.sin(ph)) * gait - 0.06 * slam - 0.08 * u.limp * badStance - 0.3 * sag;
+  u.pelvis.position.set(0, pelvisY, 0);
+  u.pelvis.rotation.set(0, 0.12 * Math.sin(ph) * live, (0.1 * Math.sin(ph) + 0.12 * u.limp * badStance * u.limpSide) * live);
+  u.pelvis.updateMatrix();
+
+  // torso: hunched, lurching side to side against the hips, kicked back by hits
+  u.upper.position.set(0, pelvisY + 0.08, 0);
+  u.upper.rotation.set(
+    (u.hunch + 0.12 * run + 0.25 * u.attack - 0.55 * rear + 0.5 * slam) * live - 0.6 * u.flinch + 0.35 * fall * dead, // goes over with the fall
+    -0.15 * Math.sin(ph) * live,
+    (-0.14 * Math.sin(ph) - 0.1 * u.limp * badStance * u.limpSide) * live + 0.04 * Math.sin(t * 0.7));
+  u.upper.updateMatrix();
+  // head lolls, nods with each step, comes up to look at its meal, snaps back when shot
+  u.head.rotation.set(
+    (-u.hunch * 0.7 + 0.12 * Math.abs(Math.sin(ph)) - 0.25 * u.attack - 0.2 * rear) * live - 0.7 * u.flinch + (fall > 0 ? 0.3 : -0.6) * dead,
+    0.25 * Math.sin(t * 0.9) * live,
+    u.tilt + 0.18 * Math.sin(t * 1.3 + 1) * live);
+  u.jaw.rotation.x = (0.12 + 0.12 * Math.abs(Math.sin(t * 2.3)) + 0.45 * u.groan + 0.35 * u.attack * Math.abs(Math.sin(t * 9)) + 0.5 * rear) * live + 0.5 * dead;
+
+  for (const l of u.limbs) {
+    // --- legs: the good leg steps through, the bad one drags its toe ---
+    const bad = u.limp && l.side === u.limpSide;
+    const p = (u.phase + (l.side > 0 ? 0 : 0.5 + 0.06 * u.limp)) % 1;
+    const { s, lift, pitch } = footCycle(p, beta);
+    l.foot3.set(l.side * (0.15 + 0.06 * dead), Z_ANKLE + lift * (bad ? 0.03 : 0.12 + 0.1 * run) * gait + 0.3 * clamber, s * L - 0.2 * clamber);
+    l.hipP.copy(l.hip).applyMatrix4(u.pelvis.matrix);
+    ik2(l.hipP, l.foot3, Z_THIGH, Z_SHIN, Z_POLE_KNEE, l.knee);
+    l.ankle.subVectors(l.foot3, l.knee).normalize().multiplyScalar(Z_SHIN).add(l.knee);
+    bone(l.thigh, l.hipP, l.knee, Z_POLE_KNEE);
+    bone(l.shin, l.knee, l.ankle, Z_POLE_KNEE);
+    l.foot.position.copy(l.ankle);
+    l.foot.rotation.set(bad ? 0.35 : pitch * live, l.side * (bad ? 0.35 : 0.12), 0);
+
+    // --- arms: reaching ones grope ahead (and claw when close); the rest hang and swing ---
+    l.sh.copy(l.shoulder).applyMatrix4(u.upper.matrix);
+    const reaches = (l.side > 0 ? u.arms >= 1 : u.arms >= 2) && !dead;
+    const k = l.side * 1.7;
+    if (reaches) {
+      const claw = u.attack * Math.sin(t * 9 + k);
+      l.reach.set(-l.side * 0.08, -0.08 + 0.06 * Math.sin(ph + k) + 0.18 * u.attack + 0.12 * claw - 0.3 * u.flinch,
+        0.72 + 0.07 * Math.sin(ph * 2 + k) + 0.2 * claw - 0.35 * u.flinch);
+    } else if (dead) {
+      l.reach.set(l.side * 0.45 * dead, -0.7, -0.15 * fall * dead); // limp, flung out to the sides
+    } else {
+      // dangling: a loose pendulum against the stride
+      l.reach.set(l.side * 0.1, -0.84, 0.1 + 0.16 * Math.sin(ph + (l.side > 0 ? Math.PI : 0)) * gait + 0.25 * u.flinch);
+    }
+    // every arm joins the swing: raised overhead, then clubbed down in front
+    if (rear) l.reach.lerp(_zReach.set(l.side * 0.22, 0.5, 0.18), rear);
+    if (slam) l.reach.lerp(_zReach.set(-l.side * 0.06, -0.3, 0.78), slam);
+    if (clamber) l.reach.lerp(_zReach.set(l.side * 0.24, -0.6, 0.45), clamber); // hands planted on the sill
+    l.reach.add(l.sh);
+    ik2(l.sh, l.reach, Z_UPPER_ARM, Z_FOREARM, _zPole.set(l.side * 0.6, -1, -0.3), l.elbow);
+    l.wrist.subVectors(l.reach, l.elbow).normalize().multiplyScalar(Z_FOREARM).add(l.elbow);
+    bone(l.upperArm, l.sh, l.elbow, _zPole);
+    bone(l.forearm, l.elbow, l.wrist, _zPole);
+  }
+}
+
+// --- the dead: crumple, topple onto the floor (or the pile), bleed out, and stay
+// there CORPSE_LIFE seconds before sinking into the boards ---
+const corpses = [];
+const CORPSE_LIFE = 20;   // seconds a body stays down
+const MAX_CORPSES = 120;  // past this the oldest start sinking early
+const BODY_THICK = 0.3;   // how much each body lying underneath raises the next
+function updateCorpses(dt) {
+  let bakes = 0;
+  for (let i = corpses.length - 1; i >= 0; i--) {
+    const z = corpses[i], u = z.userData;
+    u.deadT += dt;
+    if (!u.sinking && (u.deadT > CORPSE_LIFE || corpses.length - i > MAX_CORPSES)) sinkCorpse(z);
+    if (u.baked) {
+      if (u.sinking) {
+        u.sinkT += dt;
+        u.baked.position.y = -u.sinkT * (0.6 + u.restY * 0.5);
+        u.pool.position.y = 0.045 - u.sinkT * 0.04;
+        if (u.baked.position.y < -1.1 - u.restY) {
+          scene.remove(u.baked, u.pool);
+          u.baked.geometry.dispose();
+          corpses.splice(i, 1);
+        }
+      }
+      continue;
+    }
+    const crumple = Math.min(1, u.deadT / 0.25);
+    const fall = Math.min(1, Math.max(0, (u.deadT - 0.1) / 0.45));
+    animateZombie(z, dt, 99, crumple, crumple * (1 - 0.85 * fall)); // knees buckle, then straighten as it goes over
+    // topple: accelerate like a falling body, with a small bounce at the bottom
+    const f = fall * fall;
+    z.rotation.x = u.fallDir * (f * 1.42 - (fall >= 1 ? 0.06 * Math.exp(-(u.deadT - 0.55) * 9) * Math.sin((u.deadT - 0.55) * 30) : 0));
+    z.position.y = (0.12 + u.restY) * f;
+    // the pool spreads out from under the body
+    u.pool.scale.setScalar(Math.min(1, Math.max(0.05, (u.deadT - 0.4) / 1.4)) * u.poolSize);
+    // settled: freeze it into one static mesh (a few per frame, so a crowd dropping at once doesn't hitch)
+    if (u.deadT > 1.0 && bakes < 4) { bakeCorpse(z); bakes++; }
+  }
+}
+// a body and everything piled on top of it go down together
+function sinkCorpse(z) {
+  const u = z.userData;
+  if (u.sinking) return;
+  u.sinking = true; u.sinkT = 0;
+  for (const c of corpses) if (c.userData.under.includes(z)) sinkCorpse(c);
+}
+// merge a settled body's parts, in world space, into one mesh: a pile of a hundred
+// is a hundred draw calls instead of fifteen hundred
+function bakeCorpse(z) {
+  const u = z.userData;
+  z.updateMatrixWorld(true);
+  let n = 0;
+  for (const m of u.body) n += m.geometry.attributes.position.count;
+  const pos = new Float32Array(n * 3), nrm = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  let o = 0;
+  for (const m of u.body) {
+    const g = m.geometry, P = g.attributes.position.array, N = g.attributes.normal.array, C = g.attributes.color.array;
+    _bkN.getNormalMatrix(m.matrixWorld);
+    for (let i = 0; i < P.length; i += 3, o += 3) {
+      _bkV.fromArray(P, i).applyMatrix4(m.matrixWorld).toArray(pos, o);
+      _bkV.fromArray(N, i).applyMatrix3(_bkN).normalize().toArray(nrm, o);
+      col[o] = C[i]; col[o + 1] = C[i + 1]; col[o + 2] = C[i + 2];
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  u.baked = new THREE.Mesh(g, zombieSkin);
+  u.baked.castShadow = u.baked.receiveShadow = true;
+  scene.remove(z);
+  scene.add(u.baked);
+}
+function removeCorpses() {
+  for (const c of corpses) {
+    const u = c.userData;
+    scene.remove(c, u.pool);
+    if (u.baked) { scene.remove(u.baked); u.baked.geometry.dispose(); }
+  }
+  corpses.length = 0;
+}
+// three points along a body lying from (x, z) in direction (dx, dz)
+const bodyPoints = (x, z, dx, dz, s) => [0.5, 1.1, 1.7].map(t => [x + dx * t * s, z + dz * t * s]);
+// a blocky splat of overlapping slabs, so it doesn't read as a square rug
+const poolGeo = (() => {
+  const rng = seeded(99), slabs = [[0.8, 0.02, 0.8, 0, 0, 0, 0xffffff, 0, 0.3, 0, 0.008]];
+  for (let i = 0; i < 6; i++) {
+    const a = i * 1.1 + rng(), r = 0.3 + rng() * 0.25, s = 0.25 + rng() * 0.3;
+    slabs.push([s, 0.02, s * (0.6 + rng() * 0.6), Math.cos(a) * r, 0.003 * i, Math.sin(a) * r, 0xffffff, 0, rng() * 3, 0, 0.008]);
+  }
+  return bakeBlocks(slabs, rng);
+})();
+// `dir` (world, optional): the shot that killed it, which it falls along
+function zombieDies(z, dir) {
+  const u = z.userData;
+  u.deadT = 0;
+  u.hurt = 0;
+  for (const m of u.body) m.material = zombieSkin;
+  u.eyes.visible = false; // the light goes out
+  // fall along the shot (or away from the survivor) — forward if hit from behind
+  const fx = dir ? dir.x : z.position.x - player.position.x, fz = dir ? dir.z : z.position.z - player.position.z;
+  u.fallDir = fx * Math.sin(u.heading) + fz * Math.cos(u.heading) >= 0 ? 1 : -1;
+  // land on top of any bodies already lying where this one falls
+  const dx = Math.sin(u.heading) * u.fallDir, dz = Math.cos(u.heading) * u.fallDir;
+  u.points = bodyPoints(z.position.x, z.position.z, dx, dz, z.scale.x);
+  u.restY = 0; u.under = []; u.sinking = false; u.baked = null;
+  for (const c of corpses) {
+    const cu = c.userData;
+    if (cu.sinking || !cu.points.some(([ax, az]) => u.points.some(([bx, bz]) => (ax - bx) ** 2 + (az - bz) ** 2 < 0.36))) continue;
+    u.under.push(c);
+    u.restY = Math.max(u.restY, cu.restY + BODY_THICK);
+  }
+  u.restY = Math.min(u.restY, 1.5);
+  const pool = new THREE.Mesh(poolGeo, bloodPoolMat);
+  pool.receiveShadow = true;
+  pool.position.set(z.position.x + Math.sin(u.heading) * u.fallDir * 0.9, 0.045, z.position.z + Math.cos(u.heading) * u.fallDir * 0.9);
+  pool.rotation.y = Math.random() * Math.PI;
+  u.pool = pool; u.poolSize = 1.1 + Math.random() * 0.6;
+  pool.scale.setScalar(0.05);
+  scene.add(pool);
+  corpses.push(z);
+}
+
+function nearestOpening(pos, skip) {
+  let best = null, bd = Infinity;
+  for (const o of openings) {
+    if (o === skip) continue;
+    const d = (o.x - pos.x) ** 2 + (o.z - pos.z) ** 2;
+    if (d < bd) { bd = d; best = o; }
+  }
+  return best;
+}
+
+function inside(pos) {
+  return Math.abs(pos.x) < HALF - 0.3 && Math.abs(pos.z) < HALF - 0.3;
+}
+
+// --- doors and windows: shut at the start of a run, and stay broken once broken ---
+const CLIMB_TIME = 1.1; // seconds to clamber in over a sill
+const woodChip = new THREE.MeshStandardMaterial({ color: 0x6d6352, roughness: 0.9 });
+function resetOpenings() {
+  for (const o of openings) {
+    Object.assign(o, { hp: o.maxHp, climber: null, jolt: 0, fallT: -1 });
+    if (o.kind === 'door') {
+      o.leaf.rotation.y = 0;
+      o.fall.rotation.x = 0; o.fall.position.set(0, 0, -0.02);
+    } else {
+      o.glass.visible = true; o.glass.material = glassMat;
+      o.bars.visible = true;
+      o.shards.visible = false;
+    }
+  }
+}
+// bits flying off a door or window, into the cabin
+function burst(o, n, mat, size, speed) {
+  const sx = o.ix - o.x, sz = o.iz - o.z, l = Math.hypot(sx, sz);
+  for (let i = 0; i < n; i++) {
+    const m = new THREE.Mesh(BOX, mat);
+    m.scale.set(size * rnd(0.4, 1), size * rnd(0.2, 0.6), size * rnd(1, 2.5));
+    const along = rnd(-0.5, 0.5) * (o.w - 0.3);
+    m.position.set(o.x + (o.axis === 'x' ? along : 0), o.kind === 'door' ? rnd(0.3, 1.8) : rnd(o.sill + 0.05, o.head - 0.05), o.z + (o.axis === 'z' ? along : 0));
+    m.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    const v = speed * rnd(0.5, 1.2);
+    spawnDebris(m, new THREE.Vector3(sx / l * v + rnd(-1, 1), rnd(0.5, 2.5), sz / l * v + rnd(-1, 1)),
+      { life: rnd(2, 3.5), bounce: 0.02, spin: new THREE.Vector3(rnd(-12, 12), rnd(-12, 12), rnd(-12, 12)) });
+  }
+}
+// a zombie's blow (or the survivor's bullet, for glass) lands on a door or window
+function hitOpening(o) {
+  if (o.hp <= 0) return;
+  o.hp--;
+  o.jolt = 1;
+  if (o.kind === 'door') {
+    audio.bash(o);
+    burst(o, 2, woodChip, 0.12, 2);
+  } else if (o.hp > 0) {
+    audio.crack(o);
+    o.glass.material = glassCracked;
+  }
+  if (o.hp <= 0) breakOpening(o);
+}
+function breakOpening(o) {
+  o.hp = 0;
+  if (o.kind === 'door') {
+    // off its hinges and down onto the floor
+    o.fallT = 0;
+    o.leaf.rotation.y = 0;
+    audio.doorBreak(o);
+    burst(o, 9, woodChip, 0.16, 3.5);
+  } else {
+    o.glass.visible = false;
+    o.bars.visible = false;
+    o.shards.visible = true;
+    audio.shatter(o);
+    burst(o, 16, glassMat, 0.09, 4);
+  }
+}
+// does an unbroken door or window stand at (x, z)? (they stop bullets and blows)
+function shutAt(x, z) {
+  for (const o of openings) {
+    if (o.hp > 0 && x >= o.box.minX && x <= o.box.maxX && z >= o.box.minZ && z <= o.box.maxZ) return o;
+  }
+  return null;
+}
+function updateOpenings(dt) {
+  for (const o of openings) {
+    o.jolt *= Math.exp(-9 * dt);
+    if (o.kind === 'window') { o.pane.position.z = -0.03 * o.jolt; continue; }
+    if (o.fallT >= 0) {
+      // topples in like a slab: speeds up, slaps flat with a little bounce
+      o.fallT += dt;
+      const k = Math.min(1, o.fallT / 0.5), slap = k >= 1 ? 0.05 * Math.exp(-(o.fallT - 0.5) * 10) * Math.sin((o.fallT - 0.5) * 30) : 0;
+      o.fall.rotation.x = -(Math.PI / 2 - 0.02) * k * k + slap;
+      o.fall.position.set(0, 0.08 * k, -0.02 - 0.35 * k);
+      continue;
+    }
+    if (o.hp <= 0) continue;
+    // kicked inward on each blow
+    o.leaf.rotation.y = o.jolt * 0.07;
+  }
+}
+// start a zombie clambering in through a broken window
+function startClimb(z, o) {
+  const ud = z.userData;
+  o.climber = z;
+  ud.climb = 0; ud.climbO = o;
+  ud.climbFrom = z.position.clone();
+  ud.heading = Math.atan2(o.lx - z.position.x, o.lz - z.position.z);
+  z.rotation.y = ud.heading;
+}
+function climbStep(z, dt) {
+  const ud = z.userData, o = ud.climbO;
+  ud.climb = Math.min(1, ud.climb + dt / CLIMB_TIME);
+  const k = ud.climb, e = ease(k);
+  z.position.x = ud.climbFrom.x + (o.lx - ud.climbFrom.x) * e;
+  z.position.z = ud.climbFrom.z + (o.lz - ud.climbFrom.z) * e;
+  // up onto the sill, over on its belly, and down inside
+  z.position.y = (o.sill - 0.15) * Math.min(1, Math.sin(Math.PI * k) * 1.4);
+  z.rotation.x = 0.75 * Math.sin(Math.PI * k);
+  if (k >= 1) endClimb(z);
+}
+function endClimb(z, died) {
+  const ud = z.userData, o = ud.climbO;
+  if (o.climber === z) o.climber = null;
+  if (died && ud.climb < 0.5) z.position.copy(ud.climbFrom); // falls back out
+  else z.position.set(o.lx, 0, o.lz);
+  z.position.y = 0; z.rotation.x = 0;
+  ud.climb = -1; ud.climbO = null; ud.opening = null; ud.stage = 0;
+}
+
+// --- solid props (see SOLIDS): zombies are shoved out of them and plan a way round them ---
+const Z_RADIUS = 0.4;   // a zombie's footprint
+const ROUND_PAD = 0.35; // how wide of a corner they swing
+const _local = { x: 0, z: 0 };
+function toLocal(b, x, z) {
+  const dx = x - b.x, dz = z - b.z;
+  _local.x = dx * b.c - dz * b.s; _local.z = dx * b.s + dz * b.c;
+  return _local;
+}
+function pushOutOfSolids(pos) {
+  for (const b of SOLIDS) {
+    const { x: lx, z: lz } = toLocal(b, pos.x, pos.z);
+    const ex = b.hx + Z_RADIUS, ez = b.hz + Z_RADIUS;
+    const px = ex - Math.abs(lx), pz = ez - Math.abs(lz);
+    if (px <= 0 || pz <= 0) continue;
+    // out through the nearest face, a hair clear of it so it doesn't read as still touching
+    const nx = px < pz ? Math.sign(lx) * (ex + 0.01) : lx, nz = px < pz ? lz : Math.sign(lz) * (ez + 0.01);
+    pos.x = b.x + nx * b.c + nz * b.s;
+    pos.z = b.z - nx * b.s + nz * b.c;
+  }
+}
+// does the segment a→b (prop-local) cross the box ±hx, ±hz? (slab test)
+function segHitsBox(ax, az, bx, bz, hx, hz) {
+  let t0 = 0, t1 = 1;
+  const dx = bx - ax, dz = bz - az;
+  if (Math.abs(dx) < 1e-9) { if (Math.abs(ax) >= hx) return false; }
+  else {
+    const ta = (-hx - ax) / dx, tb = (hx - ax) / dx;
+    t0 = Math.max(t0, Math.min(ta, tb)); t1 = Math.min(t1, Math.max(ta, tb));
+  }
+  if (Math.abs(dz) < 1e-9) { if (Math.abs(az) >= hz) return false; }
+  else {
+    const ta = (-hz - az) / dz, tb = (hz - az) / dz;
+    t0 = Math.max(t0, Math.min(ta, tb)); t1 = Math.min(t1, Math.max(ta, tb));
+  }
+  return t0 < t1;
+}
+// --- finding a way round the props: a shortest path over their corners (padded out so a
+// zombie clears them), searched whenever a prop blocks the straight line to the target ---
+const SEE_SLOP = 0.05; // a zombie pressed against a prop can still see along its side
+const ROUND_NODES = SOLIDS.flatMap(b => [[1, 1], [1, -1], [-1, -1], [-1, 1]].map(([sx, sz]) => {
+  const kx = sx * (b.hx + Z_RADIUS + ROUND_PAD), kz = sz * (b.hz + Z_RADIUS + ROUND_PAD);
+  return { x: b.x + kx * b.c + kz * b.s, z: b.z - kx * b.s + kz * b.c };
+}));
+// can a zombie walk straight from a to b without going through a prop?
+function clearPath(ax, az, bx, bz) {
+  for (const b of SOLIDS) {
+    const p = toLocal(b, ax, az), px = p.x, pz = p.z, q = toLocal(b, bx, bz);
+    if (segHitsBox(px, pz, q.x, q.z, b.hx + Z_RADIUS - SEE_SLOP, b.hz + Z_RADIUS - SEE_SLOP)) return false;
+  }
+  return true;
+}
+// which corners can see each other, and how far apart they are (props don't move)
+const NODE_LINKS = ROUND_NODES.map(a => ROUND_NODES.map(b =>
+  a !== b && clearPath(a.x, a.z, b.x, b.z) ? Math.hypot(a.x - b.x, a.z - b.z) : Infinity));
+const _goal = { x: 0, z: 0 }, _from = { x: 0, z: 0 }, _toGoal = [], _done = [];
+// Where a zombie should head to get to (tx, tz): straight there if nothing's in the way,
+// otherwise the corner in sight that starts the shortest way round. It doesn't count a
+// corner it's already standing at, and stays loyal to its last pick (ud.via) unless another
+// way is clearly shorter, so it doesn't dither between two even routes.
+function routeAround(z, tx, tz) {
+  const ud = z.userData;
+  _goal.x = tx; _goal.z = tz;
+  _from.x = z.position.x; _from.z = z.position.z;
+  pushOutOfSolids(_from); // plan from where it'll be once it's been shoved clear
+  const { x, z: fz } = _from;
+  if (clearPath(x, fz, tx, tz)) { ud.via = -1; return _goal; }
+  // how far each corner is from the goal, going round (Dijkstra out from the goal)
+  const n = ROUND_NODES.length, dist = _toGoal;
+  for (let i = 0; i < n; i++) {
+    const k = ROUND_NODES[i];
+    dist[i] = clearPath(k.x, k.z, tx, tz) ? Math.hypot(tx - k.x, tz - k.z) : Infinity;
+    _done[i] = false;
+  }
+  for (let r = 0; r < n; r++) {
+    let u = -1;
+    for (let i = 0; i < n; i++) if (!_done[i] && (u < 0 || dist[i] < dist[u])) u = i;
+    if (dist[u] === Infinity) break;
+    _done[u] = true;
+    for (let i = 0; i < n; i++) dist[i] = Math.min(dist[i], dist[u] + NODE_LINKS[u][i]);
+  }
+  let best = -1, bestCost = Infinity, near = -1, nearD = Infinity;
+  for (let i = 0; i < n; i++) {
+    const k = ROUND_NODES[i], d = Math.hypot(k.x - x, k.z - fz);
+    if (d < 0.45 || !clearPath(x, fz, k.x, k.z)) continue;
+    if (d < nearD) { nearD = d; near = i; }
+    const cost = d + dist[i] - (ud.via === i ? 1 : 0);
+    if (cost < bestCost) { bestCost = cost; best = i; }
+  }
+  if (best < 0) best = near; // no way through from here: at least get round the nearest corner
+  if (best < 0) return _goal;
+  ud.via = best;
+  _goal.x = ROUND_NODES[best].x; _goal.z = ROUND_NODES[best].z;
+  return _goal;
+}
+
+function killZombie(z, idx, dir) {
+  if (z.userData.climb >= 0) endClimb(z, true);
+  spawnBlood(z.position);
+  maybeDrop(z.position);
+  zombieDies(z, dir);
+  zombies.splice(idx, 1);
+  state.kills++;
+  wvAddKill();
+}
+
+// ===================================================================
+// DROPS — supplies zombies sometimes leave behind
+// ===================================================================
+const DROP_TYPES = [
+  { id: 'med',  name: '+1 HEALTH',      color: 0xd6453c, weight: 40 },
+  { id: 'dmg',  name: 'DOUBLE DAMAGE',  color: 0xff7a2e, weight: 25 },
+  { id: 'ammo', name: 'BOTTOMLESS MAG', color: 0xe8d28a, weight: 25 },
+];
+// each pickup is a little blocky item in a soft glow of its color
+const K = 0x1a1a1a;
+const DROP_MODELS = {
+  med: [  // first-aid case, crosses on top and front
+    [0.52, 0.34, 0.36, 0, 0, 0, 0xe6e2da, 0, 0, 0, 0.05],
+    [0.3, 0.02, 0.1, 0, 0.175, 0, 0xc8302a, 0, 0, 0, 0.006], [0.1, 0.022, 0.3, 0, 0.176, 0, 0xc8302a, 0, 0, 0, 0.006],
+    [0.24, 0.08, 0.02, 0, 0, 0.185, 0xc8302a, 0, 0, 0, 0.006], [0.08, 0.22, 0.022, 0, 0, 0.186, 0xc8302a, 0, 0, 0, 0.006],
+  ],
+  dmg: [  // a pair of hot rounds
+    [0.13, 0.3, 0.13, -0.09, -0.06, 0, 0xc9a14a, 0, 0, 0, 0.03], [0.13, 0.3, 0.13, 0.09, -0.06, 0, 0xc9a14a, 0, 0, 0, 0.03],
+    [0.11, 0.16, 0.11, -0.09, 0.17, 0, 0xff5a1e, 0, 0, 0, 0.04], [0.11, 0.16, 0.11, 0.09, 0.17, 0, 0xff5a1e, 0, 0, 0, 0.04],
+    [0.06, 0.07, 0.06, -0.09, 0.27, 0, 0xff9a5a, 0, 0, 0, 0.02], [0.06, 0.07, 0.06, 0.09, 0.27, 0, 0xff9a5a, 0, 0, 0, 0.02],
+  ],
+  ammo: [ // ammo can with a stenciled band
+    [0.52, 0.3, 0.28, 0, 0, 0, 0x4f5634, 0, 0, 0, 0.04], [0.54, 0.06, 0.3, 0, 0.17, 0, 0x3d4228, 0, 0, 0, 0.02],
+    [0.24, 0.04, 0.06, 0, 0.215, 0, 0x2a2c24, 0, 0, 0, 0.01], [0.3, 0.06, 0.006, 0, 0, 0.143, 0xd8b84a, 0, 0, 0, 0.002],
+  ],
+};
+const dropMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, emissive: 0x1c1c1c });
+const dropGlow = glowTexture();
+for (const t of DROP_TYPES) {
+  t.geo = bakeBlocks(DROP_MODELS[t.id], seeded(3));
+  t.glow = new THREE.SpriteMaterial({ map: dropGlow, color: t.color, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
+}
+const DROP_CHANCE = 0.05; // per kill, before SCAVENGER
+const DROP_PITY = 30;     // guaranteed drop after this many dry kills
+const DROP_LIFE = 12;     // seconds before an uncollected drop vanishes
+const drops = [];
+
+function maybeDrop(pos) {
+  state.sinceDrop++;
+  if (Math.random() > DROP_CHANCE + state.dropBonus && state.sinceDrop < DROP_PITY) return;
+  state.sinceDrop = 0;
+  // no medkits at full health — they'd be a wasted drop
+  const pool = DROP_TYPES.filter(t => t.id !== 'med' || state.hp < state.maxHp);
+  let r = Math.random() * pool.reduce((a, t) => a + t.weight, 0);
+  spawnDrop(pool.find(t => (r -= t.weight) < 0) || pool[0], pos);
+}
+
+function spawnDrop(type, pos) {
+  const d = new THREE.Group();
+  const item = new THREE.Mesh(type.geo, dropMat); item.castShadow = true; item.scale.setScalar(1.25); d.add(item);
+  const glow = new THREE.Sprite(type.glow); glow.scale.setScalar(2.6); d.add(glow);
+  d.position.set(pos.x, 0.7, pos.z);
+  d.userData = { type, life: DROP_LIFE, t: Math.random() * 6 };
+  scene.add(d);
+  drops.push(d);
+}
+
+function collect(type) {
+  audio.pickup(type.id);
+  showToast(type.name, '#' + type.color.toString(16).padStart(6, '0'));
+  if (type.id === 'med') state.hp = Math.min(state.maxHp, state.hp + 1);
+  else if (type.id === 'dmg') state.pDamage = 10;
+  else if (type.id === 'ammo') { state.pAmmo = 8; state.reloading = false; state.mag = state.magSize; }
+}
+
+function updateDrops(dt) {
+  const lim = HALF - 0.9;
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i], ud = d.userData;
+    ud.life -= dt; ud.t += dt;
+    const p = d.position;
+    const dx = player.position.x - p.x, dz = player.position.z - p.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 0.9) { collect(ud.type); scene.remove(d); drops.splice(i, 1); continue; }
+    if (dist < 2.5) {
+      // magnet: close drops fly to the player
+      p.x += (dx / dist) * 10 * dt; p.z += (dz / dist) * 10 * dt;
+    } else {
+      // the player can't leave the cabin, so drops that land outside slide in
+      const cx = Math.max(-lim, Math.min(lim, p.x)), cz = Math.max(-lim, Math.min(lim, p.z));
+      const ox = cx - p.x, oz = cz - p.z, od = Math.hypot(ox, oz);
+      if (od > 0.01) { const st = Math.min(od, 6 * dt); p.x += (ox / od) * st; p.z += (oz / od) * st; }
+    }
+    p.y = 0.7 + Math.sin(ud.t * 3) * 0.15;
+    d.rotation.y += dt * 2;
+    d.visible = ud.life > 3 || ((ud.t * 8) | 0) % 2 === 0; // blink before vanishing
+    if (ud.life <= 0) { scene.remove(d); drops.splice(i, 1); }
+  }
+}
+
+// ===================================================================
+// UPGRADES — pick one of three after every cleared wave
+// ===================================================================
+// Each card can be taken up to `max` times per run. `ok` (optional) hides a
+// card while it would do nothing. `stat` returns [now, after] for the card.
+const UPGRADES = [
+  { id: 'mag',    cat: 'handling',  name: 'EXTENDED MAG',  desc: '+4 rounds per magazine',     max: 5, stat: s => [s.magSize, s.magSize + 4 + ' rds'],                            apply: s => { s.magSize += 4; s.mag = s.magSize; } },
+  { id: 'reload', cat: 'handling',  name: 'QUICK HANDS',   desc: 'reload 25% faster',          max: 4, stat: s => [s.reloadTime.toFixed(2), (s.reloadTime * 0.75).toFixed(2) + 's'], apply: s => { s.reloadTime *= 0.75; } },
+  { id: 'damage', cat: 'firepower', name: 'HOLLOW POINTS', desc: '+50% bullet damage',         max: 6, stat: s => [s.damage + '×', s.damage + 0.5 + '×'],                       apply: s => { s.damage += 0.5; } },
+  { id: 'rate',   cat: 'firepower', name: 'HAIR TRIGGER',  desc: 'fire 20% faster',            max: 4, stat: s => [(1 / s.fireRate).toFixed(1), (1 / (s.fireRate * 0.8)).toFixed(1) + '/s'], apply: s => { s.fireRate *= 0.8; } },
+  { id: 'pierce', cat: 'firepower', name: 'PIERCING',      desc: 'shots pierce +1 zombie', max: 3, stat: s => [s.pierce, s.pierce + 1 + ' thru'],                     apply: s => { s.pierce++; } },
+  { id: 'spread', cat: 'firepower', name: 'BUCKSHOT',      desc: '+1 bullet per shot', max: 3, stat: s => [1 + s.spread, 2 + s.spread + ' per shot'],             apply: s => { s.spread++; } },
+  { id: 'hp',     cat: 'survival',  name: 'THICK SKIN',    desc: '+1 max health, and heal it', max: 3, stat: s => [s.maxHp, s.maxHp + 1 + ' max hp'],                         apply: s => { s.maxHp++; s.hp++; } },
+  { id: 'speed',  cat: 'survival',  name: 'FLEET FOOT',    desc: 'move 12% faster',            max: 3, stat: s => [Math.round(s.speed / 6.2 * 100) + '%', Math.round(s.speed * 1.12 / 6.2 * 100) + '%'], apply: s => { s.speed *= 1.12; } },
+  { id: 'luck',   cat: 'fortune',   name: 'SCAVENGER',     desc: 'more supply drops', max: 3, stat: s => [Math.round((DROP_CHANCE + s.dropBonus) * 100) + '%', Math.round((DROP_CHANCE + s.dropBonus + 0.03) * 100) + '% drops'], apply: s => { s.dropBonus += 0.03; } },
+  { id: 'heal',   cat: 'survival',  name: 'PATCH UP',      desc: 'restore all health',         max: Infinity, ok: s => s.hp < s.maxHp, stat: s => [s.hp, s.maxHp + ' hp'], apply: s => { s.hp = s.maxHp; } },
+];
+const UPGRADE_CATS = {
+  firepower: '#d6453c',
+  handling:  '#e8d28a',
+  survival:  '#8fae6b',
+  fortune:   '#6fa8dc',
+};
+// 8x8 pixel icons in the game's blocky style: X = solid, o = dim
+const UPGRADE_ICONS = {
+  mag:    ['XX.XX.XX', 'XX.XX.XX', 'oo.oo.oo', 'oo.oo.oo', 'oo.oo.oo', 'oo.oo.oo', 'XX.XX.XX', '........'],
+  reload: ['..XXXX..', '.X....XX', 'X....XXX', 'X.......', 'X......X', 'X......X', '.X....X.', '..XXXX..'],
+  damage: ['.XXXXXX.', 'XXXXXXXX', 'X..XX..X', 'X..XX..X', 'XXXXXXXX', '.XXX.XX.', '..XXXX..', '..X.X.X.'],
+  rate:   ['....XXX.', '...XXX..', '..XXX...', '.XXXXXX.', '...XXX..', '..XXX...', '.XX.....', '.X......'],
+  pierce: ['.o..o...', '.o..o.X.', '.o..o..X', 'XXXXXXXX', '.o..o..X', '.o..o.X.', '.o..o...', '........'],
+  spread: ['......XX', '....oo..', '..oo....', 'XXooooXX', '..oo....', '....oo..', '......XX', '........'],
+  hp:     ['XXXXXXXX', 'XooooooX', 'XoooXooX', 'XooXXXoX', '.XooXoX.', '.XooooX.', '..XooX..', '...XX...'],
+  speed:  ['........', 'XX..XX..', '.XX..XX.', '..XX..XX', '.XX..XX.', 'XX..XX..', '........', '........'],
+  luck:   ['XXXXXXXX', 'XX....XX', 'X.X..X.X', 'X..XX..X', 'X..XX..X', 'X.X..X.X', 'XX....XX', 'XXXXXXXX'],
+  heal:   ['.XX..XX.', 'XXXXXXXX', 'XXXXXXXX', 'XXXXXXXX', '.XXXXXX.', '..XXXX..', '...XX...', '........'],
+};
+function pixelIcon(rows, cls = 'cicon') {
+  let r = '';
+  rows.forEach((row, y) => [...row].forEach((c, x) => {
+    if (c !== '.') r += `<rect x="${x}" y="${y}" width="1" height="1"${c === 'o' ? ' opacity=".35"' : ''}/>`;
+  }));
+  return `<svg class="${cls}" viewBox="0 0 8 8" shape-rendering="crispEdges" fill="currentColor">${r}</svg>`;
+}
+let offered = [];
+const PICK_LOCKOUT_MS = 650; // ~ when the last card finishes dealing in
+
+function openPicker(healed) {
+  const pool = UPGRADES.filter(u => (state.upgrades[u.id] || 0) < u.max && (!u.ok || u.ok(state)));
+  for (let i = pool.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  offered = pool.slice(0, 3);
+  if (!offered.length) { state.intermission = 3.2; return; } // everything maxed out
+  state.choosing = true;
+  clearTimeout(choose._t);
+  clearTimeout(openPicker._t);
+  hud.pickerTitle.textContent = 'WAVE ' + state.wave + ' CLEARED';
+  hud.pickerSub.textContent = (healed ? '+1 HEALTH  ·  ' : '') + 'CHOOSE ONE';
+  hud.cards.innerHTML = offered.map((u, i) => {
+    const owned = state.upgrades[u.id] || 0;
+    const [now, after] = u.stat(state);
+    const pips = u.max === Infinity ? '' :
+      Array.from({ length: u.max }, (_, k) => `<i class="${k < owned ? 'own' : k === owned ? 'next' : ''}"></i>`).join('');
+    return `<div class="card" data-i="${i}" style="--accent:${UPGRADE_CATS[u.cat]};animation-delay:${i * 90}ms">` +
+      `<div class="ctop"><span>${u.cat.toUpperCase()}</span><span class="ckey">${i + 1}</span></div>` +
+      pixelIcon(UPGRADE_ICONS[u.id]) +
+      `<div class="cname">${u.name}</div><div class="cdesc">${u.desc}</div>` +
+      `<div class="cstat">${now} → <b>${after}</b></div>` +
+      `<div class="clvl">${pips}</div></div>`;
+  }).join('');
+  hud.picker.classList.remove('hidden');
+  hud.cards.classList.remove('ready');
+  audio.deal(offered.length);
+  openPicker._t = setTimeout(() => hud.cards.classList.add('ready'), PICK_LOCKOUT_MS);
+}
+
+function choose(i) {
+  const u = offered[i];
+  if (!state.choosing || !u) return;
+  state.upgrades[u.id] = (state.upgrades[u.id] || 0) + 1;
+  u.apply(state);
+  state.choosing = false;
+  // brief beat so the pick registers visually before the picker closes
+  [...hud.cards.children].forEach((c, k) => c.classList.add(k === i ? 'picked' : 'dropped'));
+  clearTimeout(choose._t);
+  choose._t = setTimeout(() => hud.picker.classList.add('hidden'), 320);
+  state.intermission = 2.0;
+  showToast(u.name, UPGRADE_CATS[u.cat]);
+  audio.upgrade(u.cat);
+}
+
+// ===================================================================
+// PARTICLES (blood)
+// ===================================================================
+function spawnBlood(pos) {
+  for (let i = 0; i < 12; i++) {
+    const p = new THREE.Mesh(BOX, bloodMat);
+    const s = 0.12 + Math.random() * 0.18;
+    p.scale.set(s, s, s);
+    p.position.set(pos.x, 0.8, pos.z);
+    p.userData = {
+      v: new THREE.Vector3((Math.random() - 0.5) * 5, 3 + Math.random() * 4, (Math.random() - 0.5) * 5),
+      life: 0.6 + Math.random() * 0.4,
+    };
+    scene.add(p);
+    particles.push(p);
+  }
+}
+
+// ===================================================================
+// WAVES
+// ===================================================================
+function startWave(n) {
+  state.wave = n;
+  if (n >= 5) wvUnlock("WAVE_5");
+  if (n >= 10) wvUnlock("WAVE_10");
+  if (n >= 15) wvUnlock("WAVE_15");
+  // Zombies toughen steadily but slower than upgrades let the player scale, so
+  // runs can go long; speed caps below the player's so kiting always works.
+  state.zombieSpeed = Math.min(5.2, 2.3 + n * 0.18);
+  state.zombieHp = 2 + (n - 1) * 0.4;
+  // anything already up counts toward the wave (the yard's shamblers when you leave the title)
+  state.toSpawn = Math.max(0, 5 + n * 3 - zombies.length);
+  for (const z of zombies) { z.userData.speed = state.zombieSpeed * z.userData.pace; z.userData.hp = state.zombieHp; }
+  state.spawnTimer = 0;
+  state.intermission = 0;
+  weather.target = stormFor(n);
+  const omens = { 1: 'they are already here', 5: 'it starts to rain', 8: 'the rain sets in', 12: 'the storm breaks', 15: 'god help you' };
+  showBanner('WAVE ' + n, omens[n] || 'it gets worse');
+  audio.waveStart(n);
+}
+
+// ===================================================================
+// GAME FLOW
+// ===================================================================
+// clear everything a run leaves lying around
+function clearRun() {
+  for (const b of bullets) scene.remove(b);
+  for (const z of zombies) scene.remove(z);
+  for (const p of particles) scene.remove(p);
+  for (const d of drops) scene.remove(d);
+  for (const d of debris) scene.remove(d);
+  removeCorpses();
+  bullets.length = 0; zombies.length = 0; particles.length = 0; drops.length = 0; debris.length = 0;
+  hud.picker.classList.add('hidden');
+}
+
+// the survivor's stats before any upgrades
+const BASE_STATS = { maxHp: 3, magSize: 8, reloadTime: 1.2, fireRate: 0.13, damage: 1, pierce: 0, spread: 0, speed: 6.2, dropBonus: 0 };
+
+// `keep` carries over what's on the field (coming from the title: the survivor stays where
+// they are and the yard's zombies join wave 1, which starts once the camera is down)
+function resetGame(keep = false) {
+  if (!keep) { clearRun(); resetOpenings(); }
+  weather.set(0);
+  Object.assign(state, {
+    ...BASE_STATS, running: true, hp: BASE_STATS.maxHp, kills: 0, shots: 0, wave: 0,
+    mag: BASE_STATS.magSize, reloading: false, reloadT: 0,
+    fireCd: 0, dmgCd: 0, toSpawn: 0, spawnTimer: 0,
+    intermission: 0, choosing: false, shake: 0, upgrades: {},
+    pDamage: 0, pAmmo: 0, sinceDrop: 0,
+  });
+  if (keep) {
+    state.intermission = SWOOP_TIME * 0.85;
+    for (const z of zombies) Object.assign(z.userData, { cross: null, idle: 0, via: -1 });
+  } else {
+    player.position.set(0, 0, 0);
+    startWave(1);
+  }
+  updateHUD();
+}
+
+function startGame(fromTitle = false) {
+  audio.ensure(); // create/resume AudioContext within the click gesture
+  document.getElementById('death').classList.add('hidden');
+  title.active = false;
+  document.body.classList.remove('titling');
+  menuEl.classList.add('gone');
+  resetGame(fromTitle);
+}
+
+function setPaused(on) {
+  if (on && !state.running) return; // only a live run can pause
+  if (on === state.paused) return;
+  state.paused = on;
+  mouseFiring = false;
+  clearTouchInput();
+  for (const k in keys) keys[k] = false; // keyups are missed while the menu is up
+  document.getElementById('pauseStat').textContent = `WAVE ${state.wave} · ${state.kills} KILLS`;
+  document.getElementById('pause').classList.toggle('hidden', !on);
+  audio.pause(on);
+}
+
+function quitToTitle() {
+  setPaused(false);
+  state.running = false;
+  document.getElementById('death').classList.add('hidden');
+  enterTitle(false);
+  music.setMode('title');
+}
+
+function die() {
+  state.running = false;
+  mouseFiring = false;
+  clearTouchInput();
+  document.getElementById('deathStat').textContent =
+    `YOU REACHED WAVE ${state.wave} · ${state.kills} KILLS`;
+  // best night is ranked by kills, like the leaderboard
+  const best = store.get('best', null), record = state.kills > 0 && (!best || state.kills > best.kills);
+  if (record) store.set('best', { wave: state.wave, kills: state.kills });
+  const db = document.getElementById('deathBest');
+  db.textContent = record ? 'NEW BEST NIGHT' : best ? `BEST: WAVE ${best.wave} · ${best.kills} KILLS` : '';
+  db.classList.toggle('record', record);
+  document.getElementById('death').classList.remove('hidden');
+  audio.death();
+  if (state.wave === 1 && state.shots === 0) wvUnlock("PACIFIST");
+  wvSubmitScore(state.kills);
+}
+
+// ===================================================================
+// TITLE SCREEN — the menu sits over a live shot of the cabin: the door shut, the survivor
+// out of sight inside, a few of the dead shambling across the yard, the camera on a slow drift.
+// PLAY swoops the camera down into the gameplay view and those zombies become wave 1.
+// ===================================================================
+const TITLE_ZOMBIES = 4;
+const SWOOP_TIME = 1.8;
+const title = { active: true, t: 0, groan: 3 };
+const menuEl = document.getElementById('menu');
+const TITLE_CAM = new THREE.Vector3(2, 0, 24); // roughly where the title camera stands
+
+// The dead cross the yard between the back wall and the camera, side to side through the
+// shot, some each way so neither side empties. Past crossX() they're out of frame (wider
+// screens see more of the yard); there they wait a beat and come back in from the far edge.
+const CROSS_Z = [11.5, 15.5];
+const crossX = () => 2 + 5 * camera.aspect;
+function crossYard(z, dir, x = -dir * crossX()) {
+  const ud = z.userData, lz = rnd(...CROSS_Z);
+  z.position.set(x, 0, lz);
+  pushOutOfSolids(z.position);
+  Object.assign(ud, {
+    cross: { x: dir * (crossX() + 1), z: THREE.MathUtils.clamp(lz + rnd(-2, 2), ...CROSS_Z) },
+    // now and then one stops partway to sway a while before carrying on
+    stopX: Math.random() < 0.35 ? rnd(-5, 5) : null,
+    speed: rnd(0.7, 1.05), heading: dir * Math.PI / 2, idle: 0, via: -1,
+  });
+  z.rotation.y = ud.heading;
+}
+
+function enterTitle(splash) {
+  title.active = true;
+  clearRun();
+  resetOpenings();
+  weather.set(0); // the title is a clear night
+  state.running = false;
+  state.dmgCd = 0;
+  player.position.set(0, 0, 0); // in the middle of the cabin, below the line of the walls
+  player.rotation.y = 0;
+  // the first crowd starts spread along the way, alternating directions
+  for (let i = 0; i < TITLE_ZOMBIES; i++) {
+    const x = crossX() * (2 * (i + rnd(0.2, 0.8)) / TITLE_ZOMBIES - 1);
+    crossYard(spawnZombie(new THREE.Vector3()), i % 2 ? 1 : -1, x);
+  }
+  document.body.classList.add('titling');
+  menuEl.classList.remove('gone');
+  menuEl.classList.toggle('splash', splash);
+  menu.open(null);
+  menu.select(0, true);
+  showBest();
+}
+
+function wanderZombie(z, dt) {
+  const ud = z.userData, c = ud.cross, dir = Math.sign(c.x);
+  let walking = false;
+  if (ud.idle > 0) ud.idle -= dt; // stand and sway a while
+  else if (ud.stopX !== null && (z.position.x - ud.stopX) * dir > 0) {
+    ud.stopX = null;
+    ud.idle = rnd(1.5, 3.5);
+  } else if (z.position.x * dir > crossX()) { // out of shot: round again after a beat
+    crossYard(z, dir);
+    ud.idle = rnd(0, 1);
+  } else {
+    const g = routeAround(z, c.x, c.z);
+    walkToward(z, g.x - z.position.x, g.z - z.position.z, ud.speed, 1.5, dt);
+    walking = true;
+  }
+  ud.gait = damp(ud.gait, walking ? 1 : 0, 4, dt);
+  animateZombie(z, dt, 99);
+}
+
+function updateTitle(dt) {
+  title.t += dt;
+  // the odd groan from out in the dark
+  if ((title.groan -= dt) <= 0 && zombies.length) {
+    const gz = zombies[(Math.random() * zombies.length) | 0];
+    audio.groan(gz.position);
+    gz.userData.groan = 1;
+    title.groan = rnd(3, 7);
+  }
+}
+
+// --- camera: a slow cinematic drift on the title, the follow cam in a run, a swoop between ---
+const TITLE_FOV = 42, GAME_FOV = 55;
+const followPos = new THREE.Vector3();
+const titlePos = new THREE.Vector3(), titleLook = new THREE.Vector3(), camLook = new THREE.Vector3();
+let camMix = 0; // 0 = title shot, 1 = follow cam
+const swoop = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // ease in-out cubic
+function updateCamera(dt) {
+  tmp.copy(player.position).add(CAM_OFFSET);
+  if (state.shake > 0) {
+    state.shake = Math.max(0, state.shake - dt * 2.2);
+    const s = settings.shake ? state.shake : 0;
+    tmp.x += (Math.random() - 0.5) * s;
+    tmp.z += (Math.random() - 0.5) * s;
+    tmp.y += (Math.random() - 0.5) * s;
+  }
+  if (camMix === 0) followPos.copy(tmp);
+  else followPos.lerp(tmp, 1 - Math.pow(0.001, dt));
+  camMix = THREE.MathUtils.clamp(camMix + (title.active ? -1 : 1) * dt / SWOOP_TIME, 0, 1);
+
+  // title shot: low in the yard, drifting side to side and breathing like a handheld
+  const t = title.t;
+  titlePos.set(TITLE_CAM.x + 1.4 * Math.sin(t * 0.045), 2 + 0.2 * Math.sin(t * 0.07) + 0.03 * Math.sin(t * 1.3), TITLE_CAM.z - 1.2 * Math.sin(t * 0.031));
+  titleLook.set(-1.5 + 0.7 * Math.sin(t * 0.045 + 0.6), 2.2 + 0.02 * Math.sin(t * 1.1), 8);
+
+  const e = swoop(camMix);
+  camera.position.lerpVectors(titlePos, followPos, e);
+  camLook.lerpVectors(titleLook, player.position, e);
+  camera.lookAt(camLook);
+  const fov = THREE.MathUtils.lerp(TITLE_FOV, GAME_FOV, e);
+  if (Math.abs(camera.fov - fov) > 1e-3) { camera.fov = fov; camera.updateProjectionMatrix(); }
+  sky.position.copy(camera.position);
+}
+
+// --- the menu itself: keyboard (arrows/WASD, enter, esc) and mouse both drive it ---
+// PLAY ON WAVEDASH sends players found elsewhere to the game's Wavedash page; on Wavedash
+// (the SDK is there, or this page, its embedder or referrer is wavedash.com) it's dropped
+const WAVEDASH_URL = 'https://wavedash.com/games/abandon-all-hope';
+const onWavedash = !!Wavedash || [location.href, document.referrer, ...(location.ancestorOrigins || [])].some(u => {
+  try { return /(^|\.)wavedash\.com$/.test(new URL(u).hostname); } catch { return false; }
+});
+if (onWavedash) document.querySelector('#menuList [data-act="wavedash"]').remove();
+const installButton = document.querySelector('#menuList [data-act="install"]');
+const installedApp = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+if (onWavedash || installedApp) installButton?.remove();
+let menuButtons = [...document.querySelectorAll('#menuList button')];
+const settingRows = [...document.querySelectorAll('#settingRows .srow')];
+const installMessage = document.getElementById('installMessage');
+let deferredInstallPrompt = null;
+const menu = {
+  sel: 0, panel: null, row: 0,
+  select(i, quiet) {
+    i = (i + menuButtons.length) % menuButtons.length;
+    if (i !== this.sel && !quiet) audio.ui('move');
+    this.sel = i;
+    menuButtons.forEach((b, k) => b.classList.toggle('sel', k === i));
+    const b = menuButtons[i], m = document.getElementById('menuMarker');
+    m.style.height = b.offsetHeight + 'px';
+    m.style.transform = `translateY(${b.offsetTop}px)`;
+  },
+  open(panel) {
+    this.panel = panel;
+    document.getElementById('howPanel').classList.toggle('open', panel === 'how');
+    document.getElementById('settingsPanel').classList.toggle('open', panel === 'settings');
+    document.getElementById('installPanel').classList.toggle('open', panel === 'install');
+    if (panel === 'settings') this.selectRow(this.row, true);
+    this.hints();
+  },
+  activate(i = this.sel) {
+    if (!menuButtons[i]) return;
+    const act = menuButtons[i].dataset.act;
+    this.select(i, true);
+    if (act === 'play') { this.open(null); startGame(true); return; }
+    if (act === 'install') { requestAppInstall(); return; }
+    if (act === 'wavedash') { audio.ui('select'); window.open(WAVEDASH_URL, '_top'); return; }
+    audio.ui(this.panel === act ? 'back' : 'select');
+    this.open(this.panel === act ? null : act);
+  },
+  selectRow(i, quiet) {
+    i = (i + settingRows.length) % settingRows.length;
+    if (i !== this.row && !quiet) audio.ui('move');
+    this.row = i;
+    settingRows.forEach((r, k) => r.classList.toggle('sel', k === i));
+  },
+  adjust(key, dir) {
+    if (key === 'shake') settings.shake = dir === 0 ? !settings.shake : dir > 0;
+    else settings[key] = THREE.MathUtils.clamp(settings[key] + dir, 0, 10);
+    store.set('settings', settings);
+    audio.applyVolume();
+    audio.ui('move');
+    this.drawSettings();
+  },
+  drawSettings() {
+    for (const r of settingRows) {
+      const k = r.dataset.key, v = settings[k];
+      if (k === 'shake') {
+        r.querySelector('.toggle').innerHTML = `<i class="${v ? 'on' : ''}" data-v="1">ON</i><i class="${v ? '' : 'on'}" data-v="0">OFF</i>`;
+        r.querySelector('em').textContent = '';
+      } else {
+        r.querySelector('.meter').innerHTML = Array.from({ length: 10 }, (_, n) => `<i class="${n < v ? 'on' : ''}" data-v="${n + 1}"></i>`).join('');
+        r.querySelector('em').textContent = v * 10;
+      }
+    }
+  },
+  hints() {
+    const keys = this.panel === 'settings'
+      ? [['↑', '↓', 'SELECT'], ['←', '→', 'ADJUST'], ['ESC', 'BACK']]
+      : this.panel ? [['ESC', 'BACK']]
+      : [['↑', '↓', 'SELECT'], ['ENTER', 'CONFIRM']];
+    document.getElementById('menuHints').innerHTML = keys.map(k =>
+      `<span>${k.slice(0, -1).map(c => `<kbd>${c}</kbd>`).join('')}${k[k.length - 1]}</span>`).join('');
+  },
+  // keyboard: returns true if the title used the key
+  key(e) {
+    if (!title.active || menuEl.classList.contains('gone')) return false;
+    if (e.code === 'KeyM') return false; // mute works everywhere
+    if (menuEl.classList.contains('splash')) { this.leaveSplash(); return true; }
+    const c = e.code, up = c === 'ArrowUp' || c === 'KeyW', down = c === 'ArrowDown' || c === 'KeyS';
+    const left = c === 'ArrowLeft' || c === 'KeyA', right = c === 'ArrowRight' || c === 'KeyD';
+    const ok = c === 'Enter' || c === 'Space', back = c === 'Escape' || c === 'Backspace';
+    if (this.panel === 'settings') {
+      const key = settingRows[this.row].dataset.key;
+      if (up) this.selectRow(this.row - 1);
+      else if (down) this.selectRow(this.row + 1);
+      else if (left || right) this.adjust(key, left ? -1 : 1);
+      else if (ok && key === 'shake') this.adjust(key, 0);
+      else if (back) { audio.ui('back'); this.open(null); }
+    } else if (this.panel) {
+      if (back || ok) { audio.ui('back'); this.open(null); }
+    } else if (up) this.select(this.sel - 1);
+    else if (down) this.select(this.sel + 1);
+    else if (ok) this.activate();
+    return true;
+  },
+  leaveSplash() {
+    if (!menuEl.classList.contains('splash')) return;
+    audio.ensure();
+    menuEl.classList.remove('splash');
+    this.select(0, true);
+    this.hints();
+  },
+};
+function showInstallInstructions() {
+  const isAppleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const secureHint = window.isSecureContext ? '' : ' Install is available when this game is served securely over HTTPS.';
+  installMessage.textContent = isAppleMobile
+    ? 'To install on iPhone or iPad, tap Share in your browser, then choose Add to Home Screen.'
+    : `Open your browser menu and choose Install app or Add to Home Screen.${secureHint}`;
+  menu.open('install');
+}
+function requestAppInstall() {
+  if (!deferredInstallPrompt) {
+    if (menu.panel === 'install') {
+      audio.ui('back');
+      menu.open(null);
+    } else {
+      showInstallInstructions();
+    }
+    return;
+  }
+  const promptEvent = deferredInstallPrompt;
+  deferredInstallPrompt = null;
+  try {
+    promptEvent.prompt().then(() => promptEvent.userChoice).then(({ outcome }) => {
+      if (outcome === 'dismissed') audio.ui('back');
+    }).catch(error => {
+      console.warn('[pwa] install prompt failed:', error);
+      showInstallInstructions();
+    });
+  } catch (error) {
+    console.warn('[pwa] install prompt failed:', error);
+    showInstallInstructions();
+  }
+}
+window.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  const index = menuButtons.indexOf(installButton);
+  if (index >= 0) {
+    installButton.remove();
+    menuButtons = menuButtons.filter(button => button !== installButton);
+    menu.select(Math.min(menu.sel, menuButtons.length - 1), true);
+  }
+  if (menu.panel === 'install') menu.open(null);
+});
+menu.drawSettings();
+function showBest() {
+  const b = store.get('best', null);
+  document.getElementById('bestRun').innerHTML = b
+    ? `<span class="lbl">BEST NIGHT</span>WAVE <b>${b.wave}</b> · <b>${b.kills}</b> KILLS`
+    : '';
+}
+menuButtons.forEach(b => {
+  b.addEventListener('mouseenter', () => {
+    const i = menuButtons.indexOf(b);
+    if (i >= 0 && (!menu.panel || menu.panel !== b.dataset.act)) menu.select(i);
+  });
+  b.addEventListener('click', () => {
+    const i = menuButtons.indexOf(b);
+    if (i >= 0) menu.activate(i);
+  });
+});
+settingRows.forEach((r, i) => {
+  r.addEventListener('mouseenter', () => menu.selectRow(i));
+  r.addEventListener('click', e => {
+    const v = e.target.dataset.v, key = r.dataset.key;
+    if (v === undefined) { if (key === 'shake') menu.adjust(key, 0); return; }
+    if (key === 'shake') menu.adjust(key, v === '1' ? 1 : -1);
+    else menu.adjust(key, +v - settings[key]);
+  });
+});
+menuEl.addEventListener('click', e => {
+  if (menuEl.classList.contains('splash')) return menu.leaveSplash();
+  // clicking the open scene (not the column or a panel) closes a panel
+  if (menu.panel && !e.target.closest('.mpanel, #menuList')) { audio.ui('back'); menu.open(null); }
+});
+
+// ===================================================================
+// UPDATE
+// ===================================================================
+const PLAYER_SPEED = 6.2; // base pace — FLEET FOOT scales state.speed; the run cadence follows it gently
+const MAX_ALIVE = 30;     // spawning pauses while this many zombies are up
+const tmp = new THREE.Vector3();
+let groanT = 1;
+
+// --- zombie melee: walk up, stop at arm's length, rear back and swing. The blow lands
+// partway through, and only if you're still in range, so a step back dodges it ---
+const Z_REACH = 1.2;      // stops and swings when this close (center to center)
+const Z_LET_GO = 1.5;     // ...and only gives chase again once you're this far off
+const Z_CLOSE = 0.95;     // never gets nearer than this (no standing inside the survivor)
+const Z_SPACE = 0.8;      // zombies keep this far apart, so a crowd fans out around you
+const Z_SWING = 0.85;     // seconds from wind-up to recovered
+const Z_STRIKE = 0.2;     // the moment in the swing the blow lands
+const Z_HIT_RANGE = 1.65; // the blow connects if you're still this close
+const Z_TRACK = 7;        // rad/s a zombie turns to keep facing you while it stands and swings
+const HURT_IFRAMES = 1.5; // after a hit, the survivor can't be hit again for this long (and flickers)
+
+// is there a wall (or a shut door or window) between two points? (samples the line)
+function wallBetween(a, b) {
+  for (let i = 1; i < 4; i++) {
+    const x = a.x + (b.x - a.x) * i / 4, z = a.z + (b.z - a.z) * i / 4;
+    for (const w of wallBoxes) if (x >= w.minX && x <= w.maxX && z >= w.minZ && z <= w.maxZ) return true;
+    if (shutAt(x, z)) return true;
+  }
+  return false;
+}
+
+// turn toward (dx, dz) at up to `rate` rad/s; returns how far off it's still facing
+function faceToward(z, dx, dz, rate, dt) {
+  const ud = z.userData, dA = wrapA(Math.atan2(dx, dz) - ud.heading);
+  ud.heading += Math.max(-rate * dt, Math.min(rate * dt, dA));
+  z.rotation.y = ud.heading;
+  return Math.abs(dA) - Math.min(Math.abs(dA), rate * dt);
+}
+
+// Ease the heading toward the target instead of snapping, so zombies arc into their
+// turns, and slow down while facing well off it: a zombie that overshoots turns round
+// and comes back instead of orbiting.
+function walkToward(z, dx, dz, speed, turn, dt) {
+  const ud = z.userData, off = faceToward(z, dx, dz, turn, dt);
+  const v = speed * Math.max(0.15, Math.cos(Math.min(off, Math.PI / 2)));
+  z.position.x += Math.sin(ud.heading) * v * dt;
+  z.position.z += Math.cos(ud.heading) * v * dt;
+}
+
+function hurtPlayer() {
+  if (state.dmgCd > 0) return false;
+  state.hp--;
+  state.dmgCd = HURT_IFRAMES;
+  damageFlash();
+  audio.hurt();
+  if (state.hp <= 0) die();
+  return true;
+}
+
+function chaseZombie(z, dt) {
+  const ud = z.userData, p = player.position;
+  const pdx = p.x - z.position.x, pdz = p.z - z.position.z, pd = Math.hypot(pdx, pdz);
+  let walking = false;
+  if (ud.climb >= 0) {
+    climbStep(z, dt);
+  } else if (ud.swing >= 0) {
+    // committed to the blow: feet planted, tracking its target through the wind-up
+    const o = ud.swingAt;
+    ud.swing += dt;
+    if (ud.swing < Z_STRIKE) faceToward(z, o ? o.x - z.position.x : pdx, o ? o.z - z.position.z : pdz, Z_TRACK, dt);
+    if (!ud.struck && ud.swing >= Z_STRIKE) {
+      ud.struck = true;
+      if (o) hitOpening(o);
+      else if (!(pd < Z_HIT_RANGE && !wallBetween(z.position, p) && hurtPlayer())) audio.swipe(z.position);
+    }
+    if (ud.swing >= Z_SWING) { ud.swing = -1; ud.swingCd = rnd(0.25, 0.6); }
+  } else if (pd < (ud.standing ? Z_LET_GO : Z_REACH) && !wallBetween(z.position, p)) {
+    // at arm's length: stand, square up, and swing as soon as it's facing you (no
+    // cooldown left over from battering its way in)
+    if (!ud.standing) ud.swingCd = 0;
+    ud.standing = true;
+    const off = faceToward(z, pdx, pdz, Z_TRACK, dt);
+    ud.swingCd -= dt;
+    if (ud.swingCd <= 0 && off < 0.5) { ud.swing = 0; ud.struck = false; ud.swingAt = null; }
+  } else {
+    ud.standing = false;
+    // steer toward nearest opening if outside, else toward player
+    let tx = p.x, tz = p.z;
+    if (inside(z.position)) {
+      ud.opening = null; ud.stage = 0; // through the wall — re-pick if knocked back out
+    } else {
+      // Commit to one opening (no per-frame re-pick): walk up via its outer waypoint so
+      // it comes at the door or window square-on, then break it and go through
+      if (!ud.opening) { ud.opening = nearestOpening(z.position); ud.stage = 0; }
+      const o = ud.opening;
+      if (ud.stage === 0) {
+        tx = o.ox; tz = o.oz;
+        if ((o.ox - z.position.x) ** 2 + (o.oz - z.position.z) ** 2 < 1.4) ud.stage = 1;
+      }
+      if (ud.stage === 1) {
+        if (o.kind === 'door' && o.hp <= 0) { tx = o.ix; tz = o.iz; } // broken down: straight through
+        else if ((o.x - z.position.x) ** 2 + (o.z - z.position.z) ** 2 > 1.45 ** 2) { tx = o.fx; tz = o.fz; }
+        else {
+          // at it: batter it in, or take a turn climbing through the broken window
+          tx = null;
+          const off = faceToward(z, o.x - z.position.x, o.z - z.position.z, Z_TRACK, dt);
+          ud.swingCd -= dt;
+          if (o.hp > 0) { if (ud.swingCd <= 0 && off < 0.5) { ud.swing = 0; ud.struck = false; ud.swingAt = o; } }
+          else if (!o.climber) startClimb(z, o);
+        }
+      }
+    }
+    if (tx !== null) {
+      const g = routeAround(z, tx, tz);
+      // turn harder up close so the last few steps home in on you
+      walkToward(z, g.x - z.position.x, g.z - z.position.z, ud.speed, ud.turn * (pd < 4 ? 2.5 : 1), dt);
+      walking = true;
+    }
+  }
+  // progress check: a zombie that's been trying to walk for 2s but has barely moved (jammed
+  // in a crowd at a door, say) forgets its plan and makes for the next-nearest way in
+  if (walking && (ud.stuckT += dt) > 2) {
+    if (Math.hypot(z.position.x - ud.stuckX, z.position.z - ud.stuckZ) < 0.6 && ud.opening && !inside(z.position)) {
+      ud.opening = nearestOpening(z.position, ud.opening);
+      ud.stage = 0; ud.via = -1;
+    }
+    ud.stuckT = 0;
+  }
+  if (!walking || ud.stuckT === 0) { ud.stuckX = z.position.x; ud.stuckZ = z.position.z; if (!walking) ud.stuckT = 0; }
+  ud.gait = damp(ud.gait, walking ? 1 : 0, 8, dt);
+  animateZombie(z, dt, pd);
+}
+
+// keep the crowd from stacking into one body, out of the survivor, and out of the props
+function separateZombies() {
+  for (let i = 0; i < zombies.length; i++) {
+    const a = zombies[i].position;
+    for (let k = i + 1; k < zombies.length; k++) {
+      const b = zombies[k].position, dx = b.x - a.x, dz = b.z - a.z, d2 = dx * dx + dz * dz;
+      if (d2 >= Z_SPACE * Z_SPACE || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2), push = (Z_SPACE - d) / 2 / d;
+      a.x -= dx * push; a.z -= dz * push;
+      b.x += dx * push; b.z += dz * push;
+    }
+  }
+  for (const z of zombies) {
+    if (z.userData.climb >= 0) continue; // on the sill: the climb places it
+    if (state.running) {
+      const dx = z.position.x - player.position.x, dz = z.position.z - player.position.z, d = Math.hypot(dx, dz);
+      if (d < Z_CLOSE && d > 1e-6) { z.position.x += dx / d * (Z_CLOSE - d); z.position.z += dz / d * (Z_CLOSE - d); }
+    }
+    pushOutOfSolids(z.position);
+  }
+}
+
+function update(dt) {
+  const px = player.position.x, pz = player.position.z;
+  if (state.running) {
+    // --- movement ---
+    let mx = 0, mz = 0;
+    if (keys['KeyW'] || keys['ArrowUp']) mz -= 1;
+    if (keys['KeyS'] || keys['ArrowDown']) mz += 1;
+    if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+    mx += touchMove.x;
+    mz += touchMove.y;
+    const moving = !!(mx || mz);
+    if (moving) {
+      const l = Math.hypot(mx, mz);
+      const speed = state.speed * Math.min(1, l);
+      player.position.x += (mx / l) * speed * dt;
+      player.position.z += (mz / l) * speed * dt;
+    }
+    // clamp inside cabin
+    const lim = HALF - 0.7;
+    player.position.x = Math.max(-lim, Math.min(lim, player.position.x));
+    player.position.z = Math.max(-lim, Math.min(lim, player.position.z));
+    // On touch, the movement stick faces the survivor until a separate aim touch takes over.
+    if (touchAiming || mouseAimActive) {
+      raycaster.setFromCamera(mouse, camera);
+      if (raycaster.ray.intersectPlane(aimPlane, aimPoint)) {
+        const a = Math.atan2(aimPoint.x - player.position.x, aimPoint.z - player.position.z);
+        player.rotation.y = a;
+      }
+    } else if (touchMode && moving) {
+      player.rotation.y = Math.atan2(mx, mz);
+    }
+
+    // --- weapon ---
+    state.fireCd -= dt;
+    if (firing && !state.choosing) fire();
+    if (state.reloading) {
+      state.reloadT += dt;
+      if (state.reloadT >= state.reloadTime) finishReload();
+    }
+    state.pDamage = Math.max(0, state.pDamage - dt);
+    state.pAmmo = Math.max(0, state.pAmmo - dt);
+    updateDrops(dt);
+
+    // --- waves ---
+    if (state.choosing) {
+      // wave cleared — waiting on the upgrade pick
+    } else if (state.intermission > 0) {
+      state.intermission -= dt;
+      if (state.intermission <= 0) startWave(state.wave + 1);
+    } else {
+      if (state.toSpawn > 0) {
+        state.spawnTimer -= dt;
+        if (state.spawnTimer <= 0 && zombies.length < MAX_ALIVE) {
+          // spawn 1-2 at a time, faster on higher waves
+          const burst = 1 + (Math.random() < Math.min(0.6, state.wave * 0.08) ? 1 : 0);
+          for (let i = 0; i < burst && state.toSpawn > 0; i++) { spawnZombie(); state.toSpawn--; }
+          state.spawnTimer = Math.max(0.35, 1.4 - state.wave * 0.08);
+        }
+      } else if (zombies.length === 0) {
+        // wave cleared
+        if (state.wave === 1) wvUnlock("WAVE_1"); // survived your first wave
+        const healed = state.hp < state.maxHp;
+        state.hp = Math.min(state.maxHp, state.hp + 1);
+        audio.waveClear();
+        openPicker(healed);
+      }
+    }
+
+    state.dmgCd -= dt;
+
+    // --- zombie groans: more of them up = a busier, closer chorus ---
+    if (zombies.length) {
+      groanT -= dt;
+      if (groanT <= 0) {
+        const gz = zombies[(Math.random() * zombies.length) | 0];
+        audio.groan(gz.position);
+        gz.userData.groan = 1; // its jaw drops with the groan
+        groanT = rnd(0.5, 1.6) * 4 / Math.min(8, 2 + zombies.length * 0.5);
+      }
+    }
+  }
+  if (title.active) updateTitle(dt);
+  music.wave = state.wave;
+  music.alive = zombies.length;
+  music.lowHp = state.running && state.hp === 1;
+
+  // --- bullets ---
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    const px = b.position.x, pz = b.position.z;
+    b.position.addScaledVector(b.userData.dir, 38 * dt);
+    b.userData.life -= dt;
+    let hit = false;
+    // wall collision: sample the path traveled this frame so fast bullets
+    // can't tunnel through the thin walls (openings have no wall box; shut ones are checked below)
+    const steps = Math.max(1, Math.ceil(Math.hypot(b.position.x - px, b.position.z - pz) / (WALL_T * 0.5)));
+    for (let s = 1; s <= steps && !hit; s++) {
+      const t = s / steps;
+      const sx = px + (b.position.x - px) * t, sz = pz + (b.position.z - pz) * t;
+      for (const w of wallBoxes) {
+        if (sx >= w.minX && sx <= w.maxX && sz >= w.minZ && sz <= w.maxZ) { hit = true; break; }
+      }
+      // a shut door stops the round; glass shatters and lets it through
+      const o = !hit && shutAt(sx, sz);
+      if (o?.kind === 'door') { hit = true; o.jolt = 0.4; burst(o, 1, woodChip, 0.08, 1.5); audio.bash(o, 0.4); }
+      else if (o) breakOpening(o);
+    }
+    for (let j = zombies.length - 1; j >= 0 && !hit; j--) {
+      const z = zombies[j];
+      if (b.userData.hits.has(z)) continue; // a piercing bullet already went through this one
+      // distance from the zombie to the path traveled this frame (not just the
+      // end point), so bullets can't skip past zombies at low frame rates
+      const sx = b.position.x - px, sz = b.position.z - pz;
+      const t = Math.max(0, Math.min(1, ((z.position.x - px) * sx + (z.position.z - pz) * sz) / (sx * sx + sz * sz || 1)));
+      const dx = z.position.x - (px + sx * t), dz = z.position.z - (pz + sz * t);
+      if (dx * dx + dz * dz < 0.55) {
+        z.userData.hp -= state.damage * (state.pDamage > 0 ? 2 : 1);
+        hitZombie(z);
+        // small knockback
+        z.position.addScaledVector(b.userData.dir, 0.25);
+        if (z.userData.hp <= 0) { audio.zdeath(z.position); killZombie(z, j, b.userData.dir); }
+        else audio.hit(z.position);
+        b.userData.hits.add(z);
+        if (b.userData.pierce > 0) b.userData.pierce--;
+        else hit = true; // ends the loop; a piercing bullet keeps checking the rest
+      }
+    }
+    if (hit || b.userData.life <= 0) { scene.remove(b); bullets.splice(i, 1); }
+  }
+
+  // --- zombies ---
+  for (let j = zombies.length - 1; j >= 0; j--) {
+    const z = zombies[j];
+    const ud = z.userData;
+    // hurt flash recover
+    if (ud.hurt > 0) {
+      ud.hurt -= dt;
+      if (ud.hurt <= 0) for (const m of ud.body) m.material = zombieSkin;
+    }
+    if (state.running) chaseZombie(z, dt);
+    else if (title.active) wanderZombie(z, dt);
+  }
+  if (state.running || title.active) separateZombies();
+
+  // --- particles ---
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.userData.life -= dt;
+    p.userData.v.y -= 16 * dt;
+    p.position.addScaledVector(p.userData.v, dt);
+    if (p.position.y < 0.05) { p.position.y = 0.05; p.userData.v.set(0, 0, 0); }
+    if (p.userData.life <= 0) { scene.remove(p); particles.splice(i, 1); }
+  }
+
+  updateCorpses(dt);
+  updateOpenings(dt);
+  updateWeather(dt);
+  updateWorld(dt);
+
+  // --- survivor rig, driven by how far the survivor actually moved (so pushing into a
+  // wall doesn't run in place). Runs on the title and death screens too, so the pose settles ---
+  const inv = dt > 0 ? 1 / dt : 0;
+  animatePlayer(dt, (player.position.x - px) * inv, (player.position.z - pz) * inv);
+  // flicker while the post-hit grace period lasts
+  player.visible = !state.running || state.dmgCd <= 0 || Math.floor(state.dmgCd * 12) % 2 === 0;
+  updateDebris(dt);
+
+  // damage flash fade
+  if (flashT > 0) { flashT -= dt; hud.flash.style.opacity = Math.max(0, flashT) * 0.6; }
+
+  updateCamera(dt);
+
+  updateHUD();
+}
+
+// ===================================================================
+// WAVEDASH — platform SDK (loading screen + leaderboard)
+// ===================================================================
+const WV_LEADERBOARD = "high-scores";
+let wvLeaderboardId = null;
+
+// Submit the run's score (total kills) on death. Defensive: any SDK/network
+// failure is logged but never interrupts the game.
+//
+// We use getOrCreateLeaderboard rather than getLeaderboard so the board is
+// provisioned automatically on first use — getLeaderboard only returns a board
+// that already exists in the dashboard, so scores were silently dropped until
+// one was created by hand. More kills = better → DESC; the score is a plain
+// kill count → NUMERIC.
+async function wvSubmitScore(score) {
+  if (!Wavedash) { console.warn("[wavedash] no SDK — score not submitted"); return; }
+  try {
+    if (wvLeaderboardId == null) {
+      const lb = await Wavedash.getOrCreateLeaderboard(
+        WV_LEADERBOARD,
+        Wavedash.LeaderboardSortOrder.DESC,
+        Wavedash.LeaderboardDisplayType.NUMERIC,
+      );
+      if (!lb?.success) {
+        console.warn("[wavedash] could not get/create leaderboard:", lb?.message);
+        return;
+      }
+      wvLeaderboardId = lb.data.id;
+    }
+    const res = await Wavedash.uploadLeaderboardScore(wvLeaderboardId, score, true); // keepBest
+    if (!res?.success) {
+      console.warn("[wavedash] score upload rejected:", res?.message);
+    }
+  } catch (e) {
+    console.warn("[wavedash] score upload threw", e);
+  }
+}
+
+// ===================================================================
+// WAVEDASH — achievements & stats
+// ===================================================================
+// Two kinds of achievements are configured in the Developer Portal
+// (your game → Achievements):
+//
+//   "Triggered in the game"  → we unlock them directly with setAchievement():
+//     WAVE_1   survive your first wave
+//     WAVE_5   reach wave 5
+//     WAVE_10  reach wave 10
+//     WAVE_15  reach wave 15
+//     PACIFIST die on wave 1 without firing a shot
+//
+//   "Triggered by Wavedash"  → the platform unlocks them from a stat threshold,
+//   so we never call setAchievement for these; we just report the stat:
+//     KILLS_100   Total Kills >= 100
+//     KILLS_1000  Total Kills >= 1000
+//
+// setAchievement/setStat with an id not defined in the portal is a harmless
+// no-op, which is exactly why the old code failed silently when ids didn't
+// match. The Set dedupes so we don't spam the SDK with repeat unlocks.
+const wvUnlocked = new Set();
+function wvUnlock(id) {
+  if (!Wavedash || wvUnlocked.has(id)) return;
+  wvUnlocked.add(id);
+  try {
+    Wavedash.setAchievement(id, true); // storeNow → persist immediately
+  } catch (e) {
+    console.warn("[wavedash] achievement unlock failed", id, e);
+  }
+}
+
+// The KILLS_* achievements trigger off a cumulative "Total Kills" stat. setStat
+// overwrites and the stored value persists across sessions, so we read the
+// current total and add this kill to it (there is no increment method). This id
+// MUST match the stat configured under your game → In-Game Stats.
+const WV_STAT_KILLS = "KILLS_TOTAL";
+function wvAddKill() {
+  if (!Wavedash) return;
+  try {
+    Wavedash.setStat(WV_STAT_KILLS, (Wavedash.getStat(WV_STAT_KILLS) || 0) + 1, true);
+  } catch (e) {
+    console.warn("[wavedash] kill stat failed", e);
+  }
+}
+
+// ===================================================================
+// LOOP
+// ===================================================================
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!state.paused) update(dt);
+  touchControls.classList.toggle('hidden', !touchMode || !state.running || state.paused || state.choosing);
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+
+enterTitle(true);
+updateCamera(0);
+requestAnimationFrame(loop);
+
+if ('serviceWorker' in navigator && window.top === window && !Wavedash && window.isSecureContext) {
+  navigator.serviceWorker.register('./sw.js', { scope: './', updateViaCache: 'none' })
+    .catch(error => console.warn('[pwa] service worker registration failed:', error));
+}
+
+// Everything above is set up synchronously and there are no async assets to
+// wait on, so signal readiness immediately. This dismisses the Wavedash loading
+// screen and reveals the Abandon All Hope start overlay. (No-op when running standalone,
+// where there is no loading screen to dismiss.)
+if (Wavedash) Wavedash.init({ debug: true });
