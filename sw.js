@@ -1,4 +1,4 @@
-const VERSION = 'aah-v5';
+const VERSION = 'aah-v7';
 const SHELL_CACHE = `${VERSION}-shell`;
 const ASSET_CACHE = `${VERSION}-assets`;
 const THREE_MODULE = 'https://unpkg.com/three@0.160.0/build/three.module.js';
@@ -8,6 +8,7 @@ const SHELL_FILES = [
   './index.html',
   './assets/css/styles.css',
   './assets/js/game.js',
+  './assets/music/mixkit-feedback-dreams-588.mp3',
   './manifest.webmanifest',
   './assets/icons/icon.svg',
   './assets/icons/icon-192.png',

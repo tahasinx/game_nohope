@@ -222,7 +222,7 @@
   .mpanel::before { content: ""; position: absolute; left: -1px; right: -1px; top: -1px; height: 3px; background: #d6453c; box-shadow: 0 0 12px #d6453c; }
   .mpanel.open { opacity: 1; visibility: visible; transform: translate(0, -50%); transition-delay: 0s; }
   .mpanel h2 { font-family: "Anton", sans-serif; font-weight: normal; font-size: 30px; letter-spacing: 3px; color: #e9e2d6; }
-  #installMessage { margin-top: 12px; font-size: 18px; line-height: 1.5; color: #9aa0a8; }
+  #installMessage { margin-top: 12px; font-size: 18px; line-height: 1.5; color: #9aa0a8; white-space: pre-line; }
   .mrows { margin-top: 14px; display: flex; flex-direction: column; }
   .crow { display: flex; align-items: center; gap: 16px; padding: 6px 0; border-bottom: 1px solid #1f1f24; font-size: 19px; letter-spacing: 2px; }
   .crow .caps { width: 150px; display: flex; }

@@ -154,7 +154,7 @@ const store = {
 const settings = Object.assign({ master: 8, music: 8, shake: true }, store.get('settings', {})); // volumes are 0..10
 
 const audio = {
-  ctx: null, muted: false, waves: {}, bufs: {}, lastHit: 0, lastHover: 0, stepAlt: false,
+  ctx: null, muted: false, musicEnabled: false, waves: {}, bufs: {}, lastHit: 0, lastHover: 0, stepAlt: false,
   ensure() {
     if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -162,6 +162,7 @@ const audio = {
     this.ctx = new AC();
     this.buildVoices();
     this.buildMix();
+    this.loadMusicTrack();
     this.applyVolume();
     this.startWind();
     music.start();
@@ -239,6 +240,40 @@ const audio = {
     this.echoIn = gain(0.5, this.echo);
     this.musicWet = gain(1, this.musicIn); // dry + echo send in one
     this.musicWet.connect(this.echoIn);
+  },
+  loadMusicTrack() {
+    const track = new Audio('./assets/music/mixkit-feedback-dreams-588.mp3');
+    track.loop = true;
+    track.preload = 'auto';
+    track.addEventListener('error', () => {
+      this.disableMusicTrack(track.error);
+    });
+    this.trackMusic = track;
+    this.trackMusicSource = this.ctx.createMediaElementSource(track);
+    this.trackMusicSource.connect(this.musicIn);
+  },
+  disableMusicTrack(error) {
+    console.error('[audio] background music unavailable; using procedural score:', error);
+    this.trackMusic?.pause();
+    this.trackMusicSource?.disconnect();
+    this.trackMusic = null;
+    this.trackMusicSource = null;
+    this.applyVolume();
+  },
+  setMusicEnabled(enabled, restart = false) {
+    this.musicEnabled = enabled;
+    if (this.trackMusic) {
+      if (enabled) {
+        if (restart) this.trackMusic.currentTime = 0;
+        const track = this.trackMusic;
+        track.play().catch(error => {
+          if (this.musicEnabled && this.trackMusic === track) this.disableMusicTrack(error);
+        });
+      } else {
+        this.trackMusic.pause();
+      }
+    }
+    this.applyVolume();
   },
   // stereo noise tail with a darkening exponential decay — a big, dark room
   impulse(dur) {
@@ -558,8 +593,9 @@ const audio = {
     if (!this.ctx) return;
     const t = this.t(), m = (settings.music / 8) ** 2;
     this.mute.gain.setTargetAtTime(this.level(), t, 0.03);
-    this.musicVol.gain.setTargetAtTime(m, t, 0.03);
-    this.musicVerb.gain.setTargetAtTime(m, t, 0.03);
+    const musicLevel = this.musicEnabled ? m : 0;
+    this.musicVol.gain.setTargetAtTime(musicLevel, t, 0.03);
+    this.musicVerb.gain.setTargetAtTime(musicLevel, t, 0.03);
   },
   // menu blips: quiet and short
   ui(kind) {
@@ -572,17 +608,9 @@ const audio = {
 };
 
 // ===================================================================
-// MUSIC — an adaptive score in D minor for the chip voices, arranged like a modern
-// game soundtrack: extended chords voiced for smooth voice leading, one theme that
-// comes back in every mode (music box on the title, full band in the fight, major
-// key in the safe room), song forms that branch on how the fight is going, a
-// sidechained stereo pad, twin-lead harmony and drum fills. Sequenced in 16ths
-// with lookahead on the audio clock; mode changes land on the next beat.
-//   title   the theme on music-box bells over a slow pad, then harmonized, then an interlude
-//   combat  every 8 bars picks A (theme) / B (climax) / C (half-time breakdown) from the
-//           heat (wave + zombies alive), and layers 1-3 within each section
-//   calm    between waves: swung electric-piano comping, walking bass, the theme in F major
-//   dead    the band sags out, then the sting (audio.death)
+// MUSIC — the looping MP3 is the primary background track and runs through the music buses
+// above. Game modes still control its filtering; the procedural score below is the fallback
+// if the audio file cannot be played.
 // ===================================================================
 // chords: [bass, ...pad voicing]. Mostly rootless voicings (the bass has the root),
 // picked so each voice moves a step or less into the next chord
@@ -745,7 +773,7 @@ const music = {
   advance() {
     if (this.pending && this.step % 4 === 0) this.enter(this.pending);
     const swing = this.step % 2 ? this.swing() * this.sixteenth() : 0; // late off-beats
-    if (!audio.muted && this.mode !== 'dead' && this.mode !== 'off') this.play(this.step, this.next + swing);
+    if (!audio.trackMusic && !audio.muted && this.mode !== 'dead' && this.mode !== 'off') this.play(this.step, this.next + swing);
     this.next += this.sixteenth();
     this.step++;
   },
@@ -3370,6 +3398,7 @@ function resetGame(keep = false) {
 
 function startGame(fromTitle = false) {
   audio.ensure(); // create/resume AudioContext within the click gesture
+  audio.setMusicEnabled(true, true);
   document.getElementById('death').classList.add('hidden');
   title.active = false;
   document.body.classList.remove('titling');
@@ -3381,6 +3410,7 @@ function setPaused(on) {
   if (on && !state.running) return; // only a live run can pause
   if (on === state.paused) return;
   state.paused = on;
+  audio.setMusicEnabled(state.running && !on);
   mouseFiring = false;
   clearTouchInput();
   for (const k in keys) keys[k] = false; // keyups are missed while the menu is up
@@ -3390,8 +3420,9 @@ function setPaused(on) {
 }
 
 function quitToTitle() {
-  setPaused(false);
   state.running = false;
+  setPaused(false);
+  audio.setMusicEnabled(false);
   document.getElementById('death').classList.add('hidden');
   enterTitle(false);
   music.setMode('title');
@@ -3399,6 +3430,7 @@ function quitToTitle() {
 
 function die() {
   state.running = false;
+  audio.setMusicEnabled(false);
   mouseFiring = false;
   clearTouchInput();
   document.getElementById('deathStat').textContent =
@@ -3538,12 +3570,19 @@ const onWavedash = !!Wavedash || [location.href, document.referrer, ...(location
 });
 if (onWavedash) document.querySelector('#menuList [data-act="wavedash"]').remove();
 const installButton = document.querySelector('#menuList [data-act="install"]');
-const installedApp = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-if (onWavedash || installedApp) installButton?.remove();
+const standaloneApp = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+let installedApp = standaloneApp || store.get('installed', false);
+if (standaloneApp) store.set('installed', true);
+if (onWavedash) installButton?.remove();
 let menuButtons = [...document.querySelectorAll('#menuList button')];
 const settingRows = [...document.querySelectorAll('#settingRows .srow')];
 const installMessage = document.getElementById('installMessage');
 let deferredInstallPrompt = null;
+function updateInstallAction() {
+  installButton.querySelector('span').textContent = installedApp ? 'OPEN IN APP' : 'INSTALL APP';
+  document.getElementById('installTitle').textContent = installedApp ? 'OPEN IN APP' : 'INSTALL APP';
+}
+updateInstallAction();
 const menu = {
   sel: 0, panel: null, row: 0,
   select(i, quiet) {
@@ -3637,16 +3676,36 @@ const menu = {
     this.hints();
   },
 };
+function openInstalledApp() {
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  if (standalone) {
+    menu.open(null);
+    startGame(true);
+    return;
+  }
+  const appWindow = window.open(new URL('./', location.href).href, '_blank');
+  if (appWindow) appWindow.opener = null;
+  else {
+    installMessage.textContent = 'Allow pop-ups for this site, then choose OPEN IN APP again.';
+    menu.open('install');
+  }
+}
 function showInstallInstructions() {
   const isAppleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const secureHint = window.isSecureContext ? '' : ' Install is available when this game is served securely over HTTPS.';
   installMessage.textContent = isAppleMobile
     ? 'To install on iPhone or iPad, tap Share in your browser, then choose Add to Home Screen.'
-    : `Open your browser menu and choose Install app or Add to Home Screen.${secureHint}`;
+    : !touchMode
+      ? `Chrome: click the install icon at the right of the address bar, or open the three-dot menu > Cast, save, and share > Install page as app.\nEdge: click the Apps icon in the address bar, or open the three-dot menu > Apps > Install this site as an app.\nIf you do not see these options, use a current version of Chrome or Edge.${secureHint}`
+      : `Open your browser menu and choose Install app or Add to Home Screen.${secureHint}`;
   menu.open('install');
 }
 function requestAppInstall() {
+  if (installedApp) {
+    openInstalledApp();
+    return;
+  }
   if (!deferredInstallPrompt) {
     if (menu.panel === 'install') {
       audio.ui('back');
@@ -3676,13 +3735,12 @@ window.addEventListener('beforeinstallprompt', event => {
 });
 window.addEventListener('appinstalled', () => {
   deferredInstallPrompt = null;
-  const index = menuButtons.indexOf(installButton);
-  if (index >= 0) {
-    installButton.remove();
-    menuButtons = menuButtons.filter(button => button !== installButton);
-    menu.select(Math.min(menu.sel, menuButtons.length - 1), true);
+  installedApp = true;
+  store.set('installed', true);
+  updateInstallAction();
+  if (menu.panel === 'install') {
+    installMessage.textContent = 'This app is installed. Choose OPEN IN APP to launch it.';
   }
-  if (menu.panel === 'install') menu.open(null);
 });
 menu.drawSettings();
 function showBest() {
