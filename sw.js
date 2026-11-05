@@ -1,4 +1,4 @@
-const VERSION = 'aah-v4';
+const VERSION = 'aah-v5';
 const SHELL_CACHE = `${VERSION}-shell`;
 const ASSET_CACHE = `${VERSION}-assets`;
 const THREE_MODULE = 'https://unpkg.com/three@0.160.0/build/three.module.js';

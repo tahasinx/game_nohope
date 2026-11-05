@@ -2206,6 +2206,7 @@ const touchKnob = document.getElementById('touchKnob');
 const TOUCH_STICK_DEAD_ZONE = 0.1;
 const TOUCH_TURN_RATE = 14;
 let touchAiming = false;
+let touchFiring = false;
 let mouseAimActive = !touchMode;
 if (touchMode) document.body.classList.add('touch-device');
 const aimPoint = new THREE.Vector3();
@@ -2214,7 +2215,8 @@ const raycaster = new THREE.Raycaster();
 
 function updateFiring() {
   touchAiming = [...touchPointers.values()].some(p => p.type === 'aim');
-  firing = mouseFiring || touchAiming;
+  touchFiring = [...touchPointers.values()].some(p => p.type === 'fire');
+  firing = mouseFiring || touchAiming || touchFiring;
 }
 function setTouchAim(x, y) {
   const rect = canvas.getBoundingClientRect();
@@ -2282,7 +2284,11 @@ window.addEventListener('pointerdown', e => {
     const pointer = { type: 'move', x: e.clientX, y: e.clientY };
     touchPointers.set(e.pointerId, pointer);
     updateTouchStick(pointer);
-  } else if (e.clientX >= gameRect.left + gameRect.width * 0.42 || target?.closest('#touchFire')) {
+  } else if (target?.closest('#touchFire')) {
+    const pointer = { type: 'fire', x: e.clientX, y: e.clientY };
+    touchPointers.set(e.pointerId, pointer);
+    updateFiring();
+  } else if (e.clientX >= gameRect.left + gameRect.width * 0.42) {
     const pointer = { type: 'aim', x: e.clientX, y: e.clientY };
     touchPointers.set(e.pointerId, pointer);
     setTouchAim(e.clientX, e.clientY);
@@ -2299,7 +2305,7 @@ window.addEventListener('pointermove', e => {
   pointer.x = e.clientX;
   pointer.y = e.clientY;
   if (pointer.type === 'move') updateTouchStick(pointer);
-  else setTouchAim(e.clientX, e.clientY);
+  else if (pointer.type === 'aim') setTouchAim(e.clientX, e.clientY);
   e.preventDefault();
 });
 function releaseTouchPointer(e) {
@@ -2422,9 +2428,16 @@ function fire() {
   state.shots++;
   state.fireCd = state.fireRate;
 
-  const aim = new THREE.Vector3(aimPoint.x - player.position.x, 0, aimPoint.z - player.position.z);
-  if (aim.lengthSq() < 1e-4) return;
-  aim.normalize();
+  const aim = new THREE.Vector3();
+  if (touchFiring && touchMove.lengthSq() > 1e-4) {
+    aim.set(touchMove.x, 0, touchMove.y).normalize();
+  } else if (touchAiming || mouseAimActive) {
+    aim.set(aimPoint.x - player.position.x, 0, aimPoint.z - player.position.z);
+    if (aim.lengthSq() < 1e-4) return;
+    aim.normalize();
+  } else {
+    aim.set(Math.sin(player.rotation.y), 0, Math.cos(player.rotation.y));
+  }
 
   // spawn at muzzle world position; BUCKSHOT fans extra bullets around the aim line
   const mp = new THREE.Vector3();
