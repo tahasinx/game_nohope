@@ -1779,6 +1779,25 @@ const GRIP_L = new THREE.Vector3(0, -0.07, 0.74);  // support hand under the han
 const MAG_Y = mag.position.y;
 const MAG_BASE = new THREE.Vector3(0, -0.29, 0.53); // bottom of the seated magazine
 const EJECT = new THREE.Vector3(-0.08, 0.06, 0.48); // ejection port (right side)
+const flashlightModel = new THREE.Group();
+flashlightModel.visible = false;
+gun.add(flashlightModel);
+const flashlightBody = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.24, 6), M.metal);
+flashlightBody.rotation.x = Math.PI / 2;
+flashlightBody.position.set(0.13, -0.01, 0.99);
+flashlightBody.castShadow = true;
+flashlightModel.add(flashlightBody);
+const flashlightLensMat = mat(0xe4c76d, { emissive: 0xffd66e, emissiveIntensity: 1.4, roughness: 0.3 });
+const flashlightLens = new THREE.Mesh(new THREE.SphereGeometry(0.043, 6, 4), flashlightLensMat);
+flashlightLens.position.set(0.13, -0.01, 1.115);
+flashlightModel.add(flashlightLens);
+const gunFlashlight = new THREE.SpotLight(0xffe6b0, 0, 24, 0.38, 0.65, 1.5);
+gunFlashlight.position.set(0.13, 0.02, 1.11);
+gunFlashlight.castShadow = false;
+const gunFlashlightTarget = new THREE.Object3D();
+gunFlashlightTarget.position.set(0.13, -6, 15);
+gun.add(gunFlashlight, gunFlashlightTarget);
+gunFlashlight.target = gunFlashlightTarget;
 // the fresh magazine the support hand brings up from the chest rig
 const spareMag = new THREE.Mesh(mag.geometry, M.metal); spareMag.castShadow = true; player.add(spareMag);
 // bullets spawn here
@@ -2154,6 +2173,10 @@ function animatePlayer(dt, mx, mz) {
   flashFireMat.opacity = Math.min(1, f * 1.2);
   flashGlow.material.opacity = 0.85 * f;
   muzzleLight.intensity = rig.flashPeak * f * f;
+  const flashlightActive = state.flashlight && state.running && !state.paused;
+  flashlightModel.visible = state.flashlight;
+  flashlightLensMat.emissiveIntensity = flashlightActive ? 1.4 : 0.2;
+  gunFlashlight.intensity = flashlightActive ? 32 : 0;
   if (f > 0) {
     muzzle.getWorldPosition(muzzleLight.position);
     muzzleLight.position.x += Math.sin(aim) * 0.4; // just ahead of the brake, so the barrel
@@ -3240,6 +3263,7 @@ const UPGRADES = [
   { id: 'spread', cat: 'firepower', name: 'BUCKSHOT',      desc: '+1 bullet per shot', max: 3, stat: s => [1 + s.spread, 2 + s.spread + ' per shot'],             apply: s => { s.spread++; } },
   { id: 'hp',     cat: 'survival',  name: 'THICK SKIN',    desc: '+1 max health, and heal it', max: 3, stat: s => [s.maxHp, s.maxHp + 1 + ' max hp'],                         apply: s => { s.maxHp++; s.hp++; } },
   { id: 'speed',  cat: 'survival',  name: 'FLEET FOOT',    desc: 'move 12% faster',            max: 3, stat: s => [Math.round(s.speed / 6.2 * 100) + '%', Math.round(s.speed * 1.12 / 6.2 * 100) + '%'], apply: s => { s.speed *= 1.12; } },
+  { id: 'flashlight', cat: 'survival', name: 'TORCH LIGHT', desc: 'mount a forward beam on your rifle', max: 1, stat: s => [s.flashlight ? 'ON' : 'OFF', 'ON'], apply: s => { s.flashlight = true; } },
   { id: 'luck',   cat: 'fortune',   name: 'SCAVENGER',     desc: 'more supply drops', max: 3, stat: s => [Math.round((DROP_CHANCE + s.dropBonus) * 100) + '%', Math.round((DROP_CHANCE + s.dropBonus + 0.03) * 100) + '% drops'], apply: s => { s.dropBonus += 0.03; } },
   { id: 'heal',   cat: 'survival',  name: 'PATCH UP',      desc: 'restore all health',         max: Infinity, ok: s => s.hp < s.maxHp, stat: s => [s.hp, s.maxHp + ' hp'], apply: s => { s.hp = s.maxHp; } },
 ];
@@ -3259,6 +3283,7 @@ const UPGRADE_ICONS = {
   spread: ['......XX', '....oo..', '..oo....', 'XXooooXX', '..oo....', '....oo..', '......XX', '........'],
   hp:     ['XXXXXXXX', 'XooooooX', 'XoooXooX', 'XooXXXoX', '.XooXoX.', '.XooooX.', '..XooX..', '...XX...'],
   speed:  ['........', 'XX..XX..', '.XX..XX.', '..XX..XX', '.XX..XX.', 'XX..XX..', '........', '........'],
+  flashlight: ['...XX...', '..XXXX..', '.XXXXXX.', 'XXXXXXXX', '..XXXX..', '..X..X..', '..X..X..', '........'],
   luck:   ['XXXXXXXX', 'XX....XX', 'X.X..X.X', 'X..XX..X', 'X..XX..X', 'X.X..X.X', 'XX....XX', 'XXXXXXXX'],
   heal:   ['.XX..XX.', 'XXXXXXXX', 'XXXXXXXX', 'XXXXXXXX', '.XXXXXX.', '..XXXX..', '...XX...', '........'],
 };
@@ -3372,7 +3397,7 @@ function clearRun() {
 }
 
 // the survivor's stats before any upgrades
-const BASE_STATS = { maxHp: 3, magSize: 8, reloadTime: 1.2, fireRate: 0.13, damage: 1, pierce: 0, spread: 0, speed: 6.2, dropBonus: 0 };
+const BASE_STATS = { maxHp: 3, magSize: 8, reloadTime: 1.2, fireRate: 0.13, damage: 1, pierce: 0, spread: 0, speed: 6.2, dropBonus: 0, flashlight: false };
 
 // `keep` carries over what's on the field (coming from the title: the survivor stays where
 // they are and the yard's zombies join wave 1, which starts once the camera is down)
