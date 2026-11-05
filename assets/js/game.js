@@ -2472,23 +2472,22 @@ function finishReload() {
 
 function fire() {
   if (state.fireCd > 0 || state.reloading || state.mag <= 0 || !state.running) return;
-  if (state.pAmmo <= 0) {
-    state.mag--;
-    if (state.mag <= 0) startReload();
-  }
-  state.shots++;
-  state.fireCd = state.fireRate;
 
   const aim = new THREE.Vector3();
-  if (touchFiring && touchMove.lengthSq() > 1e-4) {
-    aim.set(touchMove.x, 0, touchMove.y).normalize();
-  } else if (touchAiming || mouseAimActive) {
+  if (touchAiming || mouseAimActive) {
     aim.set(aimPoint.x - player.position.x, 0, aimPoint.z - player.position.z);
     if (aim.lengthSq() < 1e-4) return;
     aim.normalize();
   } else {
     aim.set(Math.sin(player.rotation.y), 0, Math.cos(player.rotation.y));
   }
+
+  if (state.pAmmo <= 0) {
+    state.mag--;
+    if (state.mag <= 0) startReload();
+  }
+  state.shots++;
+  state.fireCd = state.fireRate;
 
   // spawn at muzzle world position; BUCKSHOT fans extra bullets around the aim line
   const mp = new THREE.Vector3();
@@ -3283,7 +3282,6 @@ const UPGRADE_ICONS = {
   spread: ['......XX', '....oo..', '..oo....', 'XXooooXX', '..oo....', '....oo..', '......XX', '........'],
   hp:     ['XXXXXXXX', 'XooooooX', 'XoooXooX', 'XooXXXoX', '.XooXoX.', '.XooooX.', '..XooX..', '...XX...'],
   speed:  ['........', 'XX..XX..', '.XX..XX.', '..XX..XX', '.XX..XX.', 'XX..XX..', '........', '........'],
-  flashlight: ['...XX...', '..XXXX..', '.XXXXXX.', 'XXXXXXXX', '..XXXX..', '..X..X..', '..X..X..', '........'],
   luck:   ['XXXXXXXX', 'XX....XX', 'X.X..X.X', 'X..XX..X', 'X..XX..X', 'X.X..X.X', 'XX....XX', 'XXXXXXXX'],
   heal:   ['.XX..XX.', 'XXXXXXXX', 'XXXXXXXX', 'XXXXXXXX', '.XXXXXX.', '..XXXX..', '...XX...', '........'],
 };
@@ -3293,6 +3291,28 @@ function pixelIcon(rows, cls = 'cicon') {
     if (c !== '.') r += `<rect x="${x}" y="${y}" width="1" height="1"${c === 'o' ? ' opacity=".35"' : ''}/>`;
   }));
   return `<svg class="${cls}" viewBox="0 0 8 8" shape-rendering="crispEdges" fill="currentColor">${r}</svg>`;
+}
+function flashlightIcon() {
+  return `<svg class="cicon torch-icon" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="torch-metal" x2="0" y2="1"><stop stop-color="#b8c2c2"/><stop offset=".35" stop-color="#59666a"/><stop offset="1" stop-color="#20292d"/></linearGradient>
+      <linearGradient id="torch-head" x2="0" y2="1"><stop stop-color="#d0d5ce"/><stop offset=".42" stop-color="#697579"/><stop offset="1" stop-color="#252e32"/></linearGradient>
+      <linearGradient id="torch-beam" x2="1" y2="0"><stop stop-color="#ffd879" stop-opacity=".5"/><stop offset="1" stop-color="#ffd879" stop-opacity="0"/></linearGradient>
+      <radialGradient id="torch-lens"><stop stop-color="#fff5c3"/><stop offset=".48" stop-color="#ffd66e"/><stop offset="1" stop-color="#dc8b37"/></radialGradient>
+    </defs>
+    <path d="M48 23 64 16v32l-16-7z" fill="url(#torch-beam)"/>
+    <path d="M12 26h31v12H12q-3 0-3-3v-6q0-3 3-3" fill="url(#torch-metal)" stroke="#141a1d" stroke-width="1.5"/>
+    <path d="M13 28h27" fill="none" stroke="#e1e4dc" stroke-opacity=".55" stroke-width="1.4"/>
+    <path d="M12 25 8 27v10l4 2z" fill="#343f43" stroke="#141a1d" stroke-width="1.5"/>
+    <path d="M17 26v12m3-12v12m3-12v12m3-12v12m3-12v12" stroke="#171e21" stroke-opacity=".7" stroke-width="1.4"/>
+    <path d="M34 25v14m3-14v14" stroke="#aab2ad" stroke-opacity=".55" stroke-width="1"/>
+    <path d="M41 23h7l5 4v10l-5 4h-7l2-5v-8z" fill="url(#torch-head)" stroke="#151b1e" stroke-width="1.5"/>
+    <path d="M47 24v16m2-15v14" stroke="#d1d6ce" stroke-opacity=".7" stroke-width="1.5"/>
+    <ellipse cx="52" cy="32" rx="2.6" ry="6.3" fill="#1c2528" stroke="#bfc6bc" stroke-width="1.4"/>
+    <ellipse cx="53" cy="32" rx="1.4" ry="4.3" fill="url(#torch-lens)"/>
+    <path d="M19 26v-3h6v3m-5-3v-1h4v1" fill="#344044" stroke="#171e21" stroke-width="1"/>
+    <path d="M10 29v6" stroke="#899390" stroke-width="1"/>
+  </svg>`;
 }
 let offered = [];
 const PICK_LOCKOUT_MS = 650; // ~ when the last card finishes dealing in
@@ -3314,7 +3334,7 @@ function openPicker(healed) {
       Array.from({ length: u.max }, (_, k) => `<i class="${k < owned ? 'own' : k === owned ? 'next' : ''}"></i>`).join('');
     return `<div class="card" data-i="${i}" style="--accent:${UPGRADE_CATS[u.cat]};animation-delay:${i * 90}ms">` +
       `<div class="ctop"><span>${u.cat.toUpperCase()}</span><span class="ckey">${i + 1}</span></div>` +
-      pixelIcon(UPGRADE_ICONS[u.id]) +
+      (u.id === 'flashlight' ? flashlightIcon() : pixelIcon(UPGRADE_ICONS[u.id])) +
       `<div class="cname">${u.name}</div><div class="cdesc">${u.desc}</div>` +
       `<div class="cstat">${now} → <b>${after}</b></div>` +
       `<div class="clvl">${pips}</div></div>`;
@@ -3599,7 +3619,11 @@ const standaloneApp = window.matchMedia('(display-mode: standalone)').matches ||
 let installedApp = standaloneApp || store.get('installed', false);
 if (standaloneApp) store.set('installed', true);
 if (onWavedash) installButton?.remove();
-let menuButtons = [...document.querySelectorAll('#menuList button')];
+let menuButtons = [...document.querySelectorAll('#menuList button')]
+  .filter(button => !button.hidden && getComputedStyle(button).display !== 'none');
+menuButtons.forEach((button, index) => {
+  button.querySelector('i').textContent = String(index + 1).padStart(2, '0');
+});
 const settingRows = [...document.querySelectorAll('#settingRows .srow')];
 const installMessage = document.getElementById('installMessage');
 let deferredInstallPrompt = null;
